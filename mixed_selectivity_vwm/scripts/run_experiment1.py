@@ -31,7 +31,7 @@ def parse_args():
         '--method', 
         type=str, 
         default='direct',
-        choices=['direct', 'gp_interaction', 'original', 'compare'],
+        choices=['direct', 'gp_interaction', 'simple_conjunctive', 'compare'],
         help='Generation method to use (default: direct)'
     )
     parser.add_argument(
@@ -72,7 +72,7 @@ def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4,
     Run Experiment 1 with optimized parameters for MacBook.
     
     Parameters:
-        method: Generation method ('direct', 'gp_interaction', 'original', 'compare')
+        method: Generation method ('direct', 'gp_interaction', 'simple_conjunctive', 'compare')
         n_neurons: Number of neurons to generate
         n_orientations: Number of orientation values
         n_locations: Number of spatial locations
@@ -92,7 +92,7 @@ def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4,
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
     
-    # Configuration
+    # Configuration - REMOVED 'verbose' parameter
     config = {
         'n_neurons': n_neurons,
         'n_orientations': n_orientations,
@@ -101,8 +101,7 @@ def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4,
         'spatial_lengthscale': 1.5,    # Smaller for more specificity
         'plot': plot,
         'seed': seed,
-        'verbose': True,
-        'method': method  # NEW: specify generation method
+        'method': method  # Specify generation method
     }
     
     print("Configuration:")
@@ -117,9 +116,9 @@ def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4,
     elif method == 'gp_interaction':
         print("📌 Using GP INTERACTION method: GP-based with strong")
         print("   interaction terms between orientation and location\n")
-    elif method == 'original':
-        print("📌 Using ORIGINAL method: Standard GP with product kernels")
-        print("   (tends to produce more separable tuning)\n")
+    elif method == 'simple_conjunctive':
+        print("📌 Using SIMPLE CONJUNCTIVE method: Location-dependent")
+        print("   orientation preferences for clear mixed selectivity\n")
     elif method == 'compare':
         print("📌 COMPARISON mode: Testing all methods to find the best\n")
     
@@ -150,11 +149,10 @@ def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4,
             print("⚠️  Experiment did not achieve strong mixed selectivity.")
             print(f"   Mean separability: {results['separability_stats']['mean']:.3f} (target: < 0.8)")
             
-            if method == 'original':
+            if method in ['gp_interaction', 'simple_conjunctive']:
                 print("\n💡 SUGGESTIONS:")
                 print("   1. Try --method direct for guaranteed mixed selectivity")
-                print("   2. Try --method gp_interaction for GP-based mixed selectivity")
-                print("   3. Try --method compare to see all methods")
+                print("   2. Try --method compare to see all methods")
             else:
                 print("\n   Consider adjusting parameters or trying a different method.")
         
@@ -173,7 +171,7 @@ def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4,
             print("\nMethods ranked by mixed selectivity (lower is better):")
             for i, (m, r) in enumerate(sorted_methods, 1):
                 status = "✓" if r['mean_sep'] < 0.8 else "✗"
-                print(f"  {i}. {m:15s} - Sep: {r['mean_sep']:.3f} {status}")
+                print(f"  {i}. {m:20s} - Sep: {r['mean_sep']:.3f} {status}")
             
             best_method = sorted_methods[0][0]
             print(f"\n🏆 Recommended method: {best_method}")
@@ -186,7 +184,6 @@ def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4,
         print("\nMake sure you've updated the following files:")
         print("1. mixed_selectivity/core/gaussian_process.py")
         print("2. mixed_selectivity/experiments/exp1_validation.py")
-        print("\nCopy the updated files from /mnt/user-data/outputs/")
         raise
         
     except Exception as e:

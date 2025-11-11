@@ -1,17 +1,40 @@
 """
-Experiment 1: Validate that GP generates mixed selectivity.
-Enhanced version with multiple methods for comparison.
+Experiment 1: Validation of mixed selectivity in synthetic neural populations.
+
+This experiment tests whether the generated neural tuning curves exhibit genuine
+mixed selectivity - i.e., non-separable conjunctive responses to orientation and
+spatial location.
+
+Scientific rationale:
+    Mixed selectivity is a hallmark of flexible neural computation in prefrontal
+    cortex and other brain regions. Neurons with mixed selectivity respond to
+    conjunctions of features rather than single features in isolation, enabling
+    high-dimensional representations that support complex cognitive operations.
+
+Validation approach:
+    We use Singular Value Decomposition (SVD) to quantify separability:
+        Separability = σ₁² / Σᵢ σᵢ²
+    
+    - Separability ≈ 1.0: Response is separable (r(θ,L) ≈ f(θ)·g(L))
+    - Separability < 0.8: True mixed selectivity (non-separable)
+    
+    Target: Mean population separability < 0.8
+
+References:
+    Rigotti et al. (2013) Nature
+    Fusi et al. (2016) Neuron
 """
 
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
+matplotlib.use('Agg')  # Non-interactive backend for headless environments
 import matplotlib.pyplot as plt
-from typing import Dict, Literal
+from typing import Dict, Literal, Optional
 import os
+from pathlib import Path
 
-from ..core.gaussian_process import NeuralGaussianProcess
-from ..analysis.separability import analyze_population_separability
+# FIXED: Use proper package imports for your project structure
+from mixed_selectivity.core.gaussian_process import NeuralGaussianProcess
 
 
 def run_experiment1(
@@ -22,44 +45,81 @@ def run_experiment1(
     spatial_lengthscale: float = 1.5,
     plot: bool = True,
     seed: int = 42,
-    verbose: bool = True,
     save_dir: str = 'figures/exp1',
-    method: Literal['direct', 'gp_interaction', 'original', 'compare'] = 'direct'
+    method: Literal['direct', 'gp_interaction', 'simple_conjunctive', 'compare'] = 'direct'
 ) -> Dict:
     """
-    Run Experiment 1: Generate population and test for mixed selectivity.
+    Run Experiment 1: Generate neural population and validate mixed selectivity.
     
-    Parameters:
-        method: Which generation method to use
-            - 'direct': Direct construction with guaranteed mixed selectivity
-            - 'gp_interaction': GP-based with interaction terms
-            - 'original': Original implementation
-            - 'compare': Compare all methods
+    Experimental pipeline:
+        1. Generate population with specified method
+        2. Compute separability index for each neuron via SVD
+        3. Test hypothesis: mean separability < 0.8
+        4. Visualize results and save figures
+    
+    Args:
+        n_neurons: Population size
+        n_orientations: Number of orientation values in [-π, π]
+        n_locations: Number of spatial locations
+        theta_lengthscale: Orientation kernel width (GP method only)
+        spatial_lengthscale: Spatial kernel width (GP method only)
+        plot: Whether to generate and save figures
+        seed: Random seed for reproducibility
+        save_dir: Directory to save results
+        method: Generation method or 'compare' to test both
     
     Returns:
-        Dictionary with results
+        Dictionary containing:
+            - tuning_curves: Neural responses (n_neurons, n_orientations, n_locations)
+            - separability_stats: Statistical summary of separability indices
+            - success: Boolean indicating if hypothesis test passed
+            - method: Method used for generation
     """
-    print("=" * 60)
-    print("EXPERIMENT 1: Validating Mixed Selectivity")
-    print("=" * 60)
-    print(f"\nConfiguration (optimized for MacBook):")
-    print(f"  Neurons: {n_neurons}")
-    print(f"  Grid: {n_orientations} orientations × {n_locations} locations")
-    print(f"  Method: {method}")
+    print("=" * 70)
+    print("EXPERIMENT 1: VALIDATION OF MIXED SELECTIVITY")
+    print("=" * 70)
+    print(f"\nExperimental parameters:")
+    print(f"  Population size: {n_neurons} neurons")
+    print(f"  Stimulus space: {n_orientations} orientations × {n_locations} locations")
+    print(f"  Generation method: {method}")
     print(f"  Random seed: {seed}")
+    print(f"  Hypothesis: Mean separability < 0.8")
     
     if method == 'compare':
-        # Compare all methods
-        return compare_all_methods(
+        # Compare both methods
+        return _compare_methods(
             n_neurons, n_orientations, n_locations,
             theta_lengthscale, spatial_lengthscale,
-            plot, seed, verbose, save_dir
+            plot, seed, save_dir
         )
     
-    # Phase 1: Generate population
-    print("\n" + "="*40)
-    print("PHASE 1: Generate Neural Population")
-    print("="*40)
+    # Standard single-method experiment
+    return _run_single_method(
+        n_neurons, n_orientations, n_locations,
+        theta_lengthscale, spatial_lengthscale,
+        method, plot, seed, save_dir
+    )
+
+
+def _run_single_method(
+    n_neurons: int,
+    n_orientations: int,
+    n_locations: int,
+    theta_lengthscale: float,
+    spatial_lengthscale: float,
+    method: str,
+    plot: bool,
+    seed: int,
+    save_dir: str
+) -> Dict:
+    """Execute experiment with a single generation method."""
+    
+    # ========================================
+    # PHASE 1: GENERATE NEURAL POPULATION
+    # ========================================
+    print("\n" + "=" * 70)
+    print("PHASE 1: NEURAL POPULATION GENERATION")
+    print("=" * 70)
     
     gp = NeuralGaussianProcess(
         n_orientations=n_orientations,
@@ -67,56 +127,84 @@ def run_experiment1(
         theta_lengthscale=theta_lengthscale,
         spatial_lengthscale=spatial_lengthscale,
         seed=seed,
-        method=method  # Use specified method
+        method=method
     )
     
     tuning_curves = gp.sample_neurons(n_neurons)
-    print(f"✓ Generated {n_neurons} neurons with shape {tuning_curves.shape}")
     
-    # Phase 2: Analyze separability
-    print("\n" + "="*40)
-    print("PHASE 2: Separability Analysis")
-    print("="*40)
+    print(f"\n✓ Generated population:")
+    print(f"  Shape: {tuning_curves.shape}")
+    print(f"  Mean activity: {tuning_curves.mean():.3f}")
+    print(f"  Activity range: [{tuning_curves.min():.3f}, {tuning_curves.max():.3f}]")
+    
+    # ========================================
+    # PHASE 2: SEPARABILITY ANALYSIS
+    # ========================================
+    print("\n" + "=" * 70)
+    print("PHASE 2: SEPARABILITY ANALYSIS")
+    print("=" * 70)
+    print("\nComputing SVD-based separability for each neuron...")
     
     sep_results = analyze_population_separability(tuning_curves, show_progress=True)
     
-    print(f"\n📊 Results:")
-    print(f"  Mean separability: {sep_results['mean']:.3f} ± {sep_results['std']:.3f}")
+    # Report statistics
+    print(f"\nPopulation statistics:")
+    print(f"  Mean separability:   {sep_results['mean']:.3f} ± {sep_results['std']:.3f}")
     print(f"  Median separability: {sep_results['median']:.3f}")
-    print(f"  Neurons with mixed selectivity: {sep_results['percent_mixed']:.1f}%")
+    print(f"  Range: [{sep_results['min']:.3f}, {sep_results['max']:.3f}]")
+    print(f"  Neurons with mixed selectivity (<0.8): {sep_results['percent_mixed']:.1f}%")
     
-    # Phase 3: Test hypothesis
-    print("\n" + "="*40)
-    print("HYPOTHESIS TEST")
-    print("="*40)
+    # ========================================
+    # PHASE 3: HYPOTHESIS TEST
+    # ========================================
+    print("\n" + "=" * 70)
+    print("PHASE 3: HYPOTHESIS TEST")
+    print("=" * 70)
     
-    if sep_results['mean'] < 0.8:
-        print(f"\n✅ SUCCESS: Mean separability = {sep_results['mean']:.3f} < 0.8")
-        print("   Population shows mixed selectivity!")
+    threshold = 0.8
+    success = sep_results['mean'] < threshold
+    
+    print(f"\nH₀: Mean separability < {threshold} (mixed selectivity)")
+    print(f"Result: Mean separability = {sep_results['mean']:.3f}")
+    
+    if success:
+        print(f"\n✓✓✓ HYPOTHESIS CONFIRMED")
+        print(f"    Population exhibits strong mixed selectivity!")
+        print(f"    {sep_results['percent_mixed']:.1f}% of neurons are non-separable")
     else:
-        print(f"\n⚠️  PARTIAL: Mean separability = {sep_results['mean']:.3f} ≥ 0.8")
-        print("   Population shows more separable tuning")
-        if method == 'original':
-            print("\n   💡 TIP: Try method='direct' or method='gp_interaction' for stronger mixed selectivity")
+        print(f"\n✗✗✗ HYPOTHESIS REJECTED")
+        print(f"    Population shows predominantly separable tuning")
+        print(f"    Only {sep_results['percent_mixed']:.1f}% of neurons are non-separable")
+        
+        # Provide diagnostic feedback
+        if method in ['gp_interaction', 'simple_conjunctive']:
+            print(f"\n    💡 Suggestion: Try method='direct' for guaranteed mixed selectivity")
     
-    # Phase 4: Save plots
+    # ========================================
+    # PHASE 4: VISUALIZATION
+    # ========================================
     if plot:
-        print("\n" + "="*40)
-        print("PHASE 4: Generating Figures")
-        print("="*40)
-        os.makedirs(save_dir, exist_ok=True)
-        save_results_plots(tuning_curves, sep_results, save_dir, method)
-        print(f"✓ Figures saved to {save_dir}/")
+        print("\n" + "=" * 70)
+        print("PHASE 4: GENERATING VISUALIZATIONS")
+        print("=" * 70)
+        
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        _create_result_figures(tuning_curves, sep_results, save_dir, method)
+        print(f"✓ Figures saved to: {save_dir}/")
     
+    # ========================================
+    # RETURN RESULTS
+    # ========================================
     return {
         'tuning_curves': tuning_curves,
         'separability_stats': sep_results,
-        'success': sep_results['mean'] < 0.8,
-        'method': method
+        'success': success,
+        'method': method,
+        'threshold': threshold
     }
 
 
-def compare_all_methods(
+def _compare_methods(
     n_neurons: int,
     n_orientations: int,
     n_locations: int,
@@ -124,190 +212,315 @@ def compare_all_methods(
     spatial_lengthscale: float,
     plot: bool,
     seed: int,
-    verbose: bool,
     save_dir: str
 ) -> Dict:
-    """Compare all generation methods."""
+    """Compare all available generation methods."""
     
-    print("\n" + "="*60)
-    print("COMPARING ALL METHODS")
-    print("="*60)
+    print("\n" + "=" * 70)
+    print("COMPARISON MODE: TESTING ALL METHODS")
+    print("=" * 70)
     
-    methods = ['direct', 'gp_interaction', 'original']
+    methods = ['direct', 'gp_interaction', 'simple_conjunctive']
     all_results = {}
     
     for method in methods:
-        print(f"\n{'='*40}")
-        print(f"Testing method: {method}")
-        print(f"{'='*40}")
+        print(f"\n{'='*70}")
+        print(f"  TESTING METHOD: {method.upper()}")
+        print(f"{'='*70}")
         
-        gp = NeuralGaussianProcess(
-            n_orientations=n_orientations,
-            n_locations=n_locations,
-            theta_lengthscale=theta_lengthscale,
-            spatial_lengthscale=spatial_lengthscale,
-            seed=seed,
-            method=method
+        # Run with this method
+        result = _run_single_method(
+            n_neurons, n_orientations, n_locations,
+            theta_lengthscale, spatial_lengthscale,
+            method, plot=False, seed=seed + len(all_results),
+            save_dir=f"{save_dir}/{method}"
         )
         
-        tuning_curves = gp.sample_neurons(n_neurons)
-        sep_results = analyze_population_separability(tuning_curves, show_progress=False)
-        
         all_results[method] = {
-            'tuning_curves': tuning_curves,
-            'separability_stats': sep_results,
-            'mean_sep': sep_results['mean'],
-            'percent_mixed': sep_results['percent_mixed']
+            'tuning_curves': result['tuning_curves'],
+            'separability_stats': result['separability_stats'],
+            'success': result['success'],
+            'mean_sep': result['separability_stats']['mean'],
+            'percent_mixed': result['separability_stats']['percent_mixed']
         }
-        
-        print(f"  Mean separability: {sep_results['mean']:.3f}")
-        print(f"  Mixed selectivity: {sep_results['percent_mixed']:.1f}%")
     
-    # Find best method
-    best_method = min(all_results.keys(), key=lambda k: all_results[k]['mean_sep'])
-    
-    print(f"\n{'='*60}")
-    print(f"COMPARISON RESULTS")
-    print(f"{'='*60}")
-    print(f"\n🏆 BEST METHOD: {best_method}")
-    print(f"   Mean separability: {all_results[best_method]['mean_sep']:.3f}")
-    print(f"   Mixed neurons: {all_results[best_method]['percent_mixed']:.1f}%")
-    
-    # Plot comparison
+    # Create comparison visualization
     if plot:
-        os.makedirs(save_dir, exist_ok=True)
-        plot_method_comparison(all_results, save_dir)
-        print(f"\n✓ Comparison figures saved to {save_dir}/")
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        _create_comparison_figures(all_results, save_dir)
     
-    # Return best results
-    best_results = all_results[best_method]
+    # Print comparison summary
+    print("\n" + "=" * 70)
+    print("COMPARISON SUMMARY")
+    print("=" * 70)
+    
+    sorted_methods = sorted(all_results.items(), key=lambda x: x[1]['mean_sep'])
+    
+    print(f"\n{'Rank':<6} {'Method':<20} {'Mean Sep':<12} {'Mixed %':<12} {'Status'}")
+    print("-" * 70)
+    
+    for rank, (method, r) in enumerate(sorted_methods, 1):
+        status = "✓ PASS" if r['success'] else "✗ FAIL"
+        print(f"{rank:<6} {method:<20} {r['mean_sep']:<12.3f} {r['percent_mixed']:<12.1f} {status}")
+    
+    best_method = sorted_methods[0][0]
+    print(f"\n🏆 BEST METHOD: {best_method}")
+    print(f"   Mean separability: {sorted_methods[0][1]['mean_sep']:.3f}")
+    
     return {
-        'tuning_curves': best_results['tuning_curves'],
-        'separability_stats': best_results['separability_stats'],
-        'success': best_results['mean_sep'] < 0.8,
-        'method': best_method,
-        'all_results': all_results
+        'all_results': all_results,
+        'best_method': best_method,
+        'success': sorted_methods[0][1]['success']
     }
 
 
-def save_results_plots(tuning_curves: np.ndarray, sep_results: Dict, save_dir: str, method: str):
-    """Save all plots to files."""
+def _create_result_figures(
+    tuning_curves: np.ndarray,
+    sep_results: Dict,
+    save_dir: str,
+    method: str
+) -> None:
+    """Create and save result figures."""
     
-    fig, axes = plt.subplots(2, 3, figsize=(12, 8))
+    fig = plt.figure(figsize=(15, 10))
+    gs = fig.add_gridspec(3, 4, hspace=0.35, wspace=0.3)
     
-    sorted_indices = np.argsort(sep_results['all_values'])
-    examples = [
-        (sorted_indices[0], "Most Mixed"),
-        (sorted_indices[len(sorted_indices)//2], "Medium"),
-        (sorted_indices[-1], "Most Separable")
-    ]
+    # Find best (lowest separability) and worst neurons
+    sep_values = sep_results['all_values']
+    best_idx = np.argmin(sep_values)
+    worst_idx = np.argmax(sep_values)
     
-    for i, (idx, label) in enumerate(examples):
-        ax = axes[0, i]
-        im = ax.imshow(tuning_curves[idx], aspect='auto', cmap='hot')
-        ax.set_title(f'{label}\nSep: {sep_results["all_values"][idx]:.3f}')
-        ax.set_xlabel('Location')
-        ax.set_ylabel('Orientation')
-        plt.colorbar(im, ax=ax, fraction=0.046)
+    # Plot best neuron
+    ax1 = fig.add_subplot(gs[0, 0:2])
+    im1 = ax1.imshow(tuning_curves[best_idx], aspect='auto', cmap='hot', interpolation='nearest')
+    ax1.set_title(f'Best Neuron (Lowest Sep = {sep_values[best_idx]:.3f})', fontweight='bold')
+    ax1.set_xlabel('Spatial Location')
+    ax1.set_ylabel('Orientation')
+    plt.colorbar(im1, ax=ax1, fraction=0.046)
     
-    # Separability histogram
-    ax = axes[1, 0]
-    ax.hist(sep_results['all_values'], bins=15, alpha=0.7, color='blue', edgecolor='black')
-    ax.axvline(0.8, color='red', linestyle='--', label='Mixed threshold')
-    ax.axvline(sep_results['mean'], color='green', linestyle='-', 
-               label=f'Mean: {sep_results["mean"]:.3f}')
-    ax.set_xlabel('Separability Index')
-    ax.set_ylabel('Count')
-    ax.set_title('Distribution')
-    ax.legend()
+    # Plot worst neuron
+    ax2 = fig.add_subplot(gs[0, 2:4])
+    im2 = ax2.imshow(tuning_curves[worst_idx], aspect='auto', cmap='hot', interpolation='nearest')
+    ax2.set_title(f'Worst Neuron (Highest Sep = {sep_values[worst_idx]:.3f})', fontweight='bold')
+    ax2.set_xlabel('Spatial Location')
+    ax2.set_ylabel('Orientation')
+    plt.colorbar(im2, ax=ax2, fraction=0.046)
     
-    # Method info
-    ax = axes[1, 1]
-    ax.axis('off')
-    info_text = f"""Method: {method}
+    # Histogram of separability
+    ax3 = fig.add_subplot(gs[1, :])
+    ax3.hist(sep_values, bins=20, color='steelblue', edgecolor='black', alpha=0.7)
+    ax3.axvline(0.8, color='red', linestyle='--', linewidth=2, label='Mixed threshold (0.8)')
+    ax3.axvline(sep_results['mean'], color='green', linestyle='-', linewidth=2, 
+               label=f'Mean ({sep_results["mean"]:.3f})')
+    ax3.set_xlabel('Separability Index', fontsize=11)
+    ax3.set_ylabel('Number of Neurons', fontsize=11)
+    ax3.set_title('Distribution of Separability Across Population', fontsize=12, fontweight='bold')
+    ax3.legend(fontsize=10)
+    ax3.grid(True, alpha=0.3)
     
-Mean Sep: {sep_results['mean']:.3f}
-Std Sep: {sep_results['std']:.3f}
-Median Sep: {sep_results['median']:.3f}
+    # Summary statistics
+    ax4 = fig.add_subplot(gs[2, :2])
+    ax4.axis('off')
+    
+    stats_text = f"""
+POPULATION STATISTICS
 
-Mixed Neurons: {sep_results['percent_mixed']:.1f}%
-Target: <80% separability
-Success: {'✓' if sep_results['mean'] < 0.8 else '✗'}"""
-    ax.text(0.5, 0.5, info_text, ha='center', va='center',
-            fontsize=11, fontfamily='monospace')
+Mean Separability:    {sep_results['mean']:.3f} ± {sep_results['std']:.3f}
+Median Separability:  {sep_results['median']:.3f}
+Range:                [{sep_results['min']:.3f}, {sep_results['max']:.3f}]
+
+Mixed Neurons:        {sep_results['percent_mixed']:.1f}%
+(Separability < 0.8)
+
+INTERPRETATION:
+{_get_interpretation(sep_results['mean'], sep_results['percent_mixed'])}
+"""
     
-    # Hide unused subplot
-    axes[1, 2].axis('off')
+    ax4.text(0.1, 0.5, stats_text, fontsize=10, family='monospace',
+            verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
     
-    plt.suptitle(f'Experiment 1 Results ({method}): Mean Separability = {sep_results["mean"]:.3f}')
-    plt.tight_layout()
-    plt.savefig(f'{save_dir}/exp1_results_{method}.png', dpi=150, bbox_inches='tight')
+    # Example neurons grid
+    ax5 = fig.add_subplot(gs[2, 2:])
+    n_examples = min(6, len(tuning_curves))
+    example_indices = np.random.choice(len(tuning_curves), n_examples, replace=False)
+    
+    for i, idx in enumerate(example_indices):
+        ax_small = plt.subplot(3, 2, i + 1)
+        ax_small.imshow(tuning_curves[idx], aspect='auto', cmap='hot', interpolation='nearest')
+        ax_small.set_title(f'N{idx} (S={sep_values[idx]:.2f})', fontsize=8)
+        ax_small.axis('off')
+    
+    # Main title
+    fig.suptitle(f'Experiment 1: Mixed Selectivity Validation ({method})\n'
+                f'Mean Separability = {sep_results["mean"]:.3f}',
+                fontsize=14, fontweight='bold')
+    
+    # Save figure
+    filepath = Path(save_dir) / f'exp1_results_{method}.png'
+    plt.savefig(filepath, dpi=150, bbox_inches='tight')
     plt.close()
     
-    print(f"  Saved: exp1_results_{method}.png")
+    print(f"  ✓ Saved: {filepath.name}")
 
 
-def plot_method_comparison(all_results: Dict, save_dir: str):
-    """Plot comparison of all methods."""
+def _create_comparison_figures(results: Dict, save_dir: str) -> None:
+    """Create side-by-side comparison of all methods."""
     
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
     
-    # Plot example tuning curves from each method
-    for i, (method, results) in enumerate(all_results.items()):
-        ax = axes[0, i]
-        # Show the most mixed neuron from each method
-        idx = np.argmin(results['separability_stats']['all_values'])
-        im = ax.imshow(results['tuning_curves'][idx], aspect='auto', cmap='hot')
-        ax.set_title(f'{method}\nBest neuron sep: {results["separability_stats"]["all_values"][idx]:.3f}')
-        ax.set_xlabel('Location')
-        ax.set_ylabel('Orientation')
-        plt.colorbar(im, ax=ax, fraction=0.046)
+    methods = list(results.keys())
+    colors = ['green', 'blue', 'purple']
     
-    # Comparison bar plot
-    ax = axes[1, 0]
-    methods = list(all_results.keys())
-    mean_seps = [all_results[m]['mean_sep'] for m in methods]
-    colors = ['green' if s < 0.8 else 'orange' for s in mean_seps]
+    # Plot histograms for each method
+    for i, (method, color) in enumerate(zip(methods, colors)):
+        ax = fig.add_subplot(gs[0, i])
+        r = results[method]
+        sep_vals = r['separability_stats']['all_values']
+        
+        ax.hist(sep_vals, bins=15, alpha=0.7, color=color, edgecolor='black')
+        ax.axvline(0.8, color='red', linestyle='--', linewidth=2)
+        ax.axvline(r['mean_sep'], color='darkgreen', linestyle='-', linewidth=2)
+        ax.set_title(f'{method}\nMean Sep = {r["mean_sep"]:.3f}', fontweight='bold')
+        ax.set_xlabel('Separability')
+        ax.set_ylabel('Count')
+        ax.grid(True, alpha=0.3)
     
-    bars = ax.bar(methods, mean_seps, color=colors, edgecolor='black')
-    ax.axhline(0.8, color='red', linestyle='--', label='Mixed threshold')
-    ax.set_ylabel('Mean Separability')
-    ax.set_title('Method Comparison')
-    ax.legend()
+    # Comparison bar chart
+    ax_comp = fig.add_subplot(gs[1, :])
+    x = np.arange(len(methods))
+    mean_seps = [results[m]['mean_sep'] for m in methods]
+    percent_mixed = [results[m]['percent_mixed'] for m in methods]
     
-    # Add value labels on bars
-    for bar, val in zip(bars, mean_seps):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
-                f'{val:.3f}', ha='center', va='bottom')
+    ax_comp.bar(x - 0.2, mean_seps, 0.4, label='Mean Separability', alpha=0.7, color='steelblue')
+    ax_comp.bar(x + 0.2, [p/100 for p in percent_mixed], 0.4, label='% Mixed (normalized)', 
+               alpha=0.7, color='coral')
+    ax_comp.axhline(0.8, color='red', linestyle='--', linewidth=2, label='Threshold (0.8)')
     
-    # Percentage mixed neurons
-    ax = axes[1, 1]
-    percent_mixed = [all_results[m]['percent_mixed'] for m in methods]
-    bars = ax.bar(methods, percent_mixed, color='purple', alpha=0.7, edgecolor='black')
-    ax.set_ylabel('% Mixed Neurons')
-    ax.set_title('Neurons with Mixed Selectivity')
+    ax_comp.set_xlabel('Method', fontsize=12)
+    ax_comp.set_ylabel('Value', fontsize=12)
+    ax_comp.set_title('Method Comparison', fontsize=14, fontweight='bold')
+    ax_comp.set_xticks(x)
+    ax_comp.set_xticklabels(methods, rotation=15)
+    ax_comp.legend(fontsize=10)
+    ax_comp.grid(True, alpha=0.3, axis='y')
     
-    for bar, val in zip(bars, percent_mixed):
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                f'{val:.1f}%', ha='center', va='bottom')
-    
-    # Summary table
-    ax = axes[1, 2]
-    ax.axis('off')
-    
-    summary_text = "METHOD COMPARISON\n" + "="*25 + "\n\n"
-    for method, results in all_results.items():
-        status = "✓" if results['mean_sep'] < 0.8 else "✗"
-        summary_text += f"{method:15s} {status}\n"
-        summary_text += f"  Mean Sep: {results['mean_sep']:.3f}\n"
-        summary_text += f"  Mixed: {results['percent_mixed']:.1f}%\n\n"
-    
-    ax.text(0.1, 0.5, summary_text, fontsize=10, fontfamily='monospace',
-            va='center')
-    
-    plt.suptitle('Mixed Selectivity Generation: Method Comparison', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(f'{save_dir}/method_comparison.png', dpi=150, bbox_inches='tight')
+    # Save
+    filepath = Path(save_dir) / 'method_comparison.png'
+    plt.savefig(filepath, dpi=150, bbox_inches='tight')
     plt.close()
     
-    print(f"  Saved: method_comparison.png")
+    print(f"  ✓ Saved: {filepath.name}")
+
+
+def _get_interpretation(mean_sep: float, percent_mixed: float) -> str:
+    """Generate interpretation text based on results."""
+    if mean_sep < 0.5:
+        return (f"Strong non-separability across population.\n"
+                f"      Neurons exhibit robust mixed selectivity,\n"
+                f"      suitable for flexible computation.")
+    elif mean_sep < 0.8:
+        return (f"Moderate mixed selectivity detected.\n"
+                f"      Population shows conjunctive encoding\n"
+                f"      of orientation and location.")
+    else:
+        return (f"Population shows predominantly separable tuning.\n"
+                f"      Limited evidence of mixed selectivity.\n"
+                f"      Consider using 'direct' method.")
+
+
+# ========================================
+# UTILITY: Separability analysis function
+# ========================================
+
+def analyze_population_separability(
+    tuning_curves: np.ndarray,
+    show_progress: bool = False
+) -> Dict:
+    """
+    Analyze separability of neural tuning curves using SVD.
+    
+    For each neuron, compute:
+        Separability = σ₁² / Σᵢ σᵢ²
+    
+    where σᵢ are singular values of the (orientations × locations) matrix.
+    
+    Args:
+        tuning_curves: Array of shape (n_neurons, n_orientations, n_locations)
+        show_progress: Whether to show progress bar
+        
+    Returns:
+        Dictionary with statistics: mean, std, median, min, max, 
+        percent_mixed, all_values
+    """
+    n_neurons = tuning_curves.shape[0]
+    separability_values = np.zeros(n_neurons)
+    
+    iterator = range(n_neurons)
+    if show_progress:
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(iterator, desc="Computing separability")
+        except ImportError:
+            pass
+    
+    for i in iterator:
+        # Compute SVD
+        U, S, Vt = np.linalg.svd(tuning_curves[i], full_matrices=False)
+        
+        # Separability = variance explained by first component
+        separability_values[i] = (S[0]**2) / (np.sum(S**2) + 1e-10)
+    
+    # Compute statistics
+    threshold = 0.8
+    percent_mixed = 100 * np.mean(separability_values < threshold)
+    
+    return {
+        'mean': np.mean(separability_values),
+        'std': np.std(separability_values),
+        'median': np.median(separability_values),
+        'min': np.min(separability_values),
+        'max': np.max(separability_values),
+        'percent_mixed': percent_mixed,
+        'all_values': separability_values
+    }
+
+
+# ========================================
+# MAIN EXECUTION
+# ========================================
+
+if __name__ == '__main__':
+    """
+    Example usage:
+    
+    # Test single method
+    results = run_experiment1(
+        n_neurons=50,
+        n_orientations=20,
+        n_locations=4,
+        method='direct',
+        seed=42
+    )
+    
+    # Compare methods
+    results = run_experiment1(
+        n_neurons=50,
+        method='compare',
+        seed=42
+    )
+    """
+    
+    print("\nExample: Running experiment with direct method...")
+    results = run_experiment1(
+        n_neurons=20,
+        n_orientations=20,
+        n_locations=4,
+        method='direct',
+        plot=True,
+        seed=42
+    )
+    
+    print(f"\n✓ Experiment complete!")
+    print(f"  Success: {results['success']}")
+    print(f"  Mean separability: {results['separability_stats']['mean']:.3f}")
