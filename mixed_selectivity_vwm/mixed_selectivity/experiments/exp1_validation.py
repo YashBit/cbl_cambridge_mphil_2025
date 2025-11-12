@@ -26,15 +26,24 @@ References:
 """
 
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend for headless environments
-import matplotlib.pyplot as plt
 from typing import Dict, Literal, Optional
 import os
 from pathlib import Path
 
-# FIXED: Use proper package imports for your project structure
-from mixed_selectivity.core.gaussian_process import NeuralGaussianProcess
+# Use Plotly for elegant, publication-quality visualizations
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
+
+# Import from the actual location in your project
+# Adjust this import path based on your project structure
+try:
+    from mixed_selectivity.core.gaussian_process import NeuralGaussianProcess
+except ImportError:
+    # Fallback for direct script execution
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from core.gaussian_process import NeuralGaussianProcess
 
 
 def run_experiment1(
@@ -66,7 +75,7 @@ def run_experiment1(
         plot: Whether to generate and save figures
         seed: Random seed for reproducibility
         save_dir: Directory to save results
-        method: Generation method or 'compare' to test both
+        method: Generation method or 'compare' to test all
     
     Returns:
         Dictionary containing:
@@ -86,7 +95,7 @@ def run_experiment1(
     print(f"  Hypothesis: Mean separability < 0.8")
     
     if method == 'compare':
-        # Compare both methods
+        # Compare all methods
         return _compare_methods(
             n_neurons, n_orientations, n_locations,
             theta_lengthscale, spatial_lengthscale,
@@ -167,9 +176,24 @@ def _run_single_method(
     print(f"\nH₀: Mean separability < {threshold} (mixed selectivity)")
     print(f"Result: Mean separability = {sep_results['mean']:.3f}")
     
+    # Add method-specific interpretation
+    if method == 'gp_interaction':
+        print(f"\nGP Interaction Method Notes:")
+        print(f"  - Non-separability from parameter coupling (Phases 1-2)")
+        print(f"  - No artificial conjunction injection")
+        print(f"  - Expected range: 0.55-0.65")
+        if sep_results['mean'] < 0.55:
+            print(f"  ✓ Exceptionally strong non-separability achieved")
+        elif sep_results['mean'] < 0.65:
+            print(f"  ✓ Within expected range for pure parameter coupling")
+        elif sep_results['mean'] < 0.8:
+            print(f"  ✓ Moderate mixed selectivity (still passes threshold)")
+        else:
+            print(f"  ⚠️  Above expected range - consider adjusting lengthscales")
+    
     if success:
         print(f"\n✓✓✓ HYPOTHESIS CONFIRMED")
-        print(f"    Population exhibits strong mixed selectivity!")
+        print(f"    Population exhibits mixed selectivity!")
         print(f"    {sep_results['percent_mixed']:.1f}% of neurons are non-separable")
     else:
         print(f"\n✗✗✗ HYPOTHESIS REJECTED")
@@ -280,153 +304,441 @@ def _create_result_figures(
     save_dir: str,
     method: str
 ) -> None:
-    """Create and save result figures."""
+    """Create elegant, publication-quality result figures using Plotly."""
     
-    fig = plt.figure(figsize=(15, 10))
-    gs = fig.add_gridspec(3, 4, hspace=0.35, wspace=0.3)
+    # Color scheme
+    COLORS = {
+        'primary': '#2E86AB',
+        'success': '#06A77D',
+        'danger': '#D90429',
+        'neutral': '#6C757D',
+    }
     
-    # Find best (lowest separability) and worst neurons
     sep_values = sep_results['all_values']
     best_idx = np.argmin(sep_values)
     worst_idx = np.argmax(sep_values)
+    n_neurons = len(sep_values)
     
-    # Plot best neuron
-    ax1 = fig.add_subplot(gs[0, 0:2])
-    im1 = ax1.imshow(tuning_curves[best_idx], aspect='auto', cmap='hot', interpolation='nearest')
-    ax1.set_title(f'Best Neuron (Lowest Sep = {sep_values[best_idx]:.3f})', fontweight='bold')
-    ax1.set_xlabel('Spatial Location')
-    ax1.set_ylabel('Orientation')
-    plt.colorbar(im1, ax=ax1, fraction=0.046)
+    # =================================================================
+    # FIGURE 1: Tuning Curves Comparison (Best vs Worst)
+    # =================================================================
+    fig1 = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            f'<b>Highest Mixed Selectivity</b><br><sub>Neuron {best_idx} | Separability = {sep_values[best_idx]:.3f}</sub>',
+            f'<b>Lowest Mixed Selectivity</b><br><sub>Neuron {worst_idx} | Separability = {sep_values[worst_idx]:.3f}</sub>'
+        ),
+        horizontal_spacing=0.15
+    )
     
-    # Plot worst neuron
-    ax2 = fig.add_subplot(gs[0, 2:4])
-    im2 = ax2.imshow(tuning_curves[worst_idx], aspect='auto', cmap='hot', interpolation='nearest')
-    ax2.set_title(f'Worst Neuron (Highest Sep = {sep_values[worst_idx]:.3f})', fontweight='bold')
-    ax2.set_xlabel('Spatial Location')
-    ax2.set_ylabel('Orientation')
-    plt.colorbar(im2, ax=ax2, fraction=0.046)
+    # Best neuron heatmap
+    fig1.add_trace(
+        go.Heatmap(
+            z=tuning_curves[best_idx],
+            colorscale='Hot',
+            showscale=True,
+            colorbar=dict(title='<b>Firing<br>Rate</b>', x=0.45, len=0.85),
+            hovertemplate='Location: %{x}<br>Orientation: %{y}<br>Rate: %{z:.3f}<extra></extra>'
+        ),
+        row=1, col=1
+    )
     
-    # Histogram of separability
-    ax3 = fig.add_subplot(gs[1, :])
-    ax3.hist(sep_values, bins=20, color='steelblue', edgecolor='black', alpha=0.7)
-    ax3.axvline(0.8, color='red', linestyle='--', linewidth=2, label='Mixed threshold (0.8)')
-    ax3.axvline(sep_results['mean'], color='green', linestyle='-', linewidth=2, 
-               label=f'Mean ({sep_results["mean"]:.3f})')
-    ax3.set_xlabel('Separability Index', fontsize=11)
-    ax3.set_ylabel('Number of Neurons', fontsize=11)
-    ax3.set_title('Distribution of Separability Across Population', fontsize=12, fontweight='bold')
-    ax3.legend(fontsize=10)
-    ax3.grid(True, alpha=0.3)
+    # Worst neuron heatmap
+    fig1.add_trace(
+        go.Heatmap(
+            z=tuning_curves[worst_idx],
+            colorscale='Hot',
+            showscale=True,
+            colorbar=dict(title='<b>Firing<br>Rate</b>', x=1.02, len=0.85),
+            hovertemplate='Location: %{x}<br>Orientation: %{y}<br>Rate: %{z:.3f}<extra></extra>'
+        ),
+        row=1, col=2
+    )
     
-    # Summary statistics
-    ax4 = fig.add_subplot(gs[2, :2])
-    ax4.axis('off')
+    fig1.update_xaxes(title_text='<b>Spatial Location</b>', row=1, col=1)
+    fig1.update_xaxes(title_text='<b>Spatial Location</b>', row=1, col=2)
+    fig1.update_yaxes(title_text='<b>Orientation Index</b>', row=1, col=1)
+    fig1.update_yaxes(title_text='<b>Orientation Index</b>', row=1, col=2)
     
-    stats_text = f"""
-POPULATION STATISTICS
-
-Mean Separability:    {sep_results['mean']:.3f} ± {sep_results['std']:.3f}
-Median Separability:  {sep_results['median']:.3f}
-Range:                [{sep_results['min']:.3f}, {sep_results['max']:.3f}]
-
-Mixed Neurons:        {sep_results['percent_mixed']:.1f}%
-(Separability < 0.8)
-
-INTERPRETATION:
-{_get_interpretation(sep_results['mean'], sep_results['percent_mixed'])}
-"""
+    fig1.update_layout(
+        title=dict(
+            text=f'<b>Neural Tuning Curves: Mixed vs. Separable Selectivity ({method})</b><br>' +
+                 '<sub>Lower separability → stronger conjunctive coding of orientation × location</sub>',
+            x=0.5,
+            xanchor='center',
+            font=dict(size=16)
+        ),
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(family='Arial', size=11),
+        width=1100,
+        height=500,
+        margin=dict(l=70, r=70, t=120, b=70)
+    )
     
-    ax4.text(0.1, 0.5, stats_text, fontsize=10, family='monospace',
-            verticalalignment='center', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    filepath1 = Path(save_dir) / f'fig1_tuning_curves_{method}.html'
+    fig1.write_html(str(filepath1))
+    print(f"  ✓ Saved: {filepath1.name}")
     
-    # Example neurons grid
-    ax5 = fig.add_subplot(gs[2, 2:])
-    n_examples = min(6, len(tuning_curves))
-    example_indices = np.random.choice(len(tuning_curves), n_examples, replace=False)
+    # =================================================================
+    # FIGURE 2: Separability Distribution Histogram
+    # =================================================================
+    fig2 = go.Figure()
     
-    for i, idx in enumerate(example_indices):
-        ax_small = plt.subplot(3, 2, i + 1)
-        ax_small.imshow(tuning_curves[idx], aspect='auto', cmap='hot', interpolation='nearest')
-        ax_small.set_title(f'N{idx} (S={sep_values[idx]:.2f})', fontsize=8)
-        ax_small.axis('off')
+    fig2.add_trace(go.Histogram(
+        x=sep_values,
+        nbinsx=20,
+        marker=dict(color=COLORS['primary'], line=dict(color='white', width=1)),
+        opacity=0.8,
+        hovertemplate='Separability: %{x:.3f}<br>Count: %{y}<extra></extra>'
+    ))
     
-    # Main title
-    fig.suptitle(f'Experiment 1: Mixed Selectivity Validation ({method})\n'
-                f'Mean Separability = {sep_results["mean"]:.3f}',
-                fontsize=14, fontweight='bold')
+    # Threshold line
+    fig2.add_vline(
+        x=0.8,
+        line=dict(color=COLORS['danger'], width=3, dash='dash'),
+        annotation=dict(
+            text='Threshold (0.8)',
+            textangle=-90,
+            yshift=10,
+            font=dict(size=11, color=COLORS['danger'])
+        )
+    )
     
-    # Save figure
-    filepath = Path(save_dir) / f'exp1_results_{method}.png'
-    plt.savefig(filepath, dpi=150, bbox_inches='tight')
-    plt.close()
+    # Mean line
+    fig2.add_vline(
+        x=sep_results['mean'],
+        line=dict(color=COLORS['success'], width=3),
+        annotation=dict(
+            text=f'Mean ({sep_results["mean"]:.3f})',
+            textangle=-90,
+            yshift=-10,
+            font=dict(size=11, color=COLORS['success'])
+        )
+    )
     
-    print(f"  ✓ Saved: {filepath.name}")
+    fig2.update_layout(
+        title=dict(
+            text=f'<b>Distribution of Separability Indices ({method})</b><br>' +
+                 f'<sub>{sep_results["percent_mixed"]:.1f}% of neurons exhibit mixed selectivity (separability < 0.8)</sub>',
+            x=0.5,
+            xanchor='center',
+            font=dict(size=16)
+        ),
+        xaxis=dict(
+            title='<b>Separability Index</b>',
+            gridcolor='lightgray',
+            range=[max(0, sep_results['min']-0.05), min(1, sep_results['max']+0.05)]
+        ),
+        yaxis=dict(title='<b>Number of Neurons</b>', gridcolor='lightgray'),
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(family='Arial', size=11),
+        showlegend=False,
+        width=900,
+        height=550,
+        margin=dict(l=70, r=70, t=110, b=70)
+    )
+    
+    filepath2 = Path(save_dir) / f'fig2_separability_distribution_{method}.html'
+    fig2.write_html(str(filepath2))
+    print(f"  ✓ Saved: {filepath2.name}")
+    
+    # =================================================================
+    # FIGURE 3: Population Scatter Plot
+    # =================================================================
+    mixed = sep_values < 0.8
+    colors_scatter = [COLORS['success'] if m else COLORS['neutral'] for m in mixed]
+    
+    fig3 = go.Figure()
+    
+    fig3.add_trace(go.Scatter(
+        x=np.arange(n_neurons),
+        y=sep_values,
+        mode='markers',
+        marker=dict(
+            size=11,
+            color=colors_scatter,
+            line=dict(width=1, color='white'),
+            opacity=0.85
+        ),
+        text=[f'Neuron {i}<br>Sep: {s:.3f}<br>{"Mixed" if m else "Separable"}' 
+              for i, (s, m) in enumerate(zip(sep_values, mixed))],
+        hovertemplate='%{text}<extra></extra>'
+    ))
+    
+    # Threshold line
+    fig3.add_hline(
+        y=0.8,
+        line=dict(color=COLORS['danger'], width=2, dash='dash'),
+        annotation=dict(text='Threshold (0.8)', xanchor='left', x=0.02, 
+                       font=dict(size=10, color=COLORS['danger']))
+    )
+    
+    # Mean line
+    fig3.add_hline(
+        y=sep_results['mean'],
+        line=dict(color=COLORS['primary'], width=2),
+        annotation=dict(text=f'Mean ({sep_results["mean"]:.3f})', xanchor='left', x=0.02,
+                       font=dict(size=10, color=COLORS['primary']))
+    )
+    
+    fig3.update_layout(
+        title=dict(
+            text=f'<b>Separability Index Across Individual Neurons ({method})</b><br>' +
+                 f'<sub>Population: {n_neurons} neurons | Mixed selectivity: {sep_results["percent_mixed"]:.1f}%</sub>',
+            x=0.5,
+            xanchor='center',
+            font=dict(size=16)
+        ),
+        xaxis=dict(title='<b>Neuron Index</b>', gridcolor='lightgray'),
+        yaxis=dict(
+            title='<b>Separability Index</b>',
+            gridcolor='lightgray',
+            range=[max(0, sep_results['min']-0.05), min(1, sep_results['max']+0.05)]
+        ),
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(family='Arial', size=11),
+        showlegend=False,
+        width=950,
+        height=550,
+        margin=dict(l=70, r=70, t=110, b=70)
+    )
+    
+    filepath3 = Path(save_dir) / f'fig3_population_scatter_{method}.html'
+    fig3.write_html(str(filepath3))
+    print(f"  ✓ Saved: {filepath3.name}")
+    
+    # =================================================================
+    # FIGURE 4: Summary Statistics Card
+    # =================================================================
+    fig4 = go.Figure()
+    
+    metrics = [
+        ('Mean Separability', f"{sep_results['mean']:.3f} ± {sep_results['std']:.3f}"),
+        ('Median Separability', f"{sep_results['median']:.3f}"),
+        ('Range', f"[{sep_results['min']:.3f}, {sep_results['max']:.3f}]"),
+        ('Mixed Neurons (<0.8)', f"{sep_results['percent_mixed']:.1f}%"),
+        ('Separable Neurons (≥0.8)', f"{100-sep_results['percent_mixed']:.1f}%"),
+    ]
+    
+    y_positions = np.linspace(0.8, 0.25, len(metrics))
+    
+    for (label, value), y_pos in zip(metrics, y_positions):
+        fig4.add_annotation(
+            text=f'<b>{label}:</b>',
+            x=0.28, y=y_pos,
+            xref='paper', yref='paper',
+            xanchor='right',
+            showarrow=False,
+            font=dict(size=14, color=COLORS['neutral'])
+        )
+        
+        color = COLORS['success'] if 'Mixed' in label else COLORS['primary']
+        fig4.add_annotation(
+            text=f'<b>{value}</b>',
+            x=0.32, y=y_pos,
+            xref='paper', yref='paper',
+            xanchor='left',
+            showarrow=False,
+            font=dict(size=15, color=color)
+        )
+    
+    # Interpretation
+    interpretation = _get_interpretation(sep_results['mean'], sep_results['percent_mixed'], method)
+    fig4.add_annotation(
+        text=f'<i>{interpretation}</i>',
+        x=0.5, y=0.08,
+        xref='paper', yref='paper',
+        xanchor='center',
+        showarrow=False,
+        font=dict(size=11, color=COLORS['neutral']),
+        bgcolor='rgba(248, 249, 250, 0.9)',
+        bordercolor=COLORS['primary'],
+        borderwidth=1.5,
+        borderpad=12
+    )
+    
+    fig4.update_layout(
+        title=dict(
+            text=f'<b>Population Statistics Summary</b><br><sub>Method: {method}</sub>',
+            x=0.5,
+            xanchor='center',
+            font=dict(size=18)
+        ),
+        xaxis=dict(visible=False, range=[0, 1]),
+        yaxis=dict(visible=False, range=[0, 1]),
+        plot_bgcolor='white',
+        paper_bgcolor='#F8F9FA',
+        font=dict(family='Arial'),
+        width=750,
+        height=550,
+        margin=dict(l=50, r=50, t=90, b=50)
+    )
+    
+    filepath4 = Path(save_dir) / f'fig4_summary_statistics_{method}.html'
+    fig4.write_html(str(filepath4))
+    print(f"  ✓ Saved: {filepath4.name}")
 
 
 def _create_comparison_figures(results: Dict, save_dir: str) -> None:
-    """Create side-by-side comparison of all methods."""
+    """Create elegant side-by-side comparison of all methods using Plotly."""
     
-    fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
+    COLORS = {
+        'direct': '#06A77D',
+        'gp_interaction': '#2E86AB',
+        'simple_conjunctive': '#A23B72',
+        'threshold': '#D90429',
+    }
     
     methods = list(results.keys())
-    colors = ['green', 'blue', 'purple']
     
-    # Plot histograms for each method
-    for i, (method, color) in enumerate(zip(methods, colors)):
-        ax = fig.add_subplot(gs[0, i])
-        r = results[method]
-        sep_vals = r['separability_stats']['all_values']
+    # =================================================================
+    # FIGURE: Method Comparison
+    # =================================================================
+    fig = make_subplots(
+        rows=2, cols=len(methods),
+        subplot_titles=[f'<b>{m}</b><br><sub>Sep={results[m]["mean_sep"]:.3f}</sub>' 
+                       for m in methods],
+        vertical_spacing=0.15,
+        horizontal_spacing=0.12,
+        specs=[[{'type': 'xy'}]*len(methods), [{'type': 'xy'}]*len(methods)]
+    )
+    
+    # Row 1: Histograms for each method
+    for i, method in enumerate(methods, 1):
+        sep_vals = results[method]['separability_stats']['all_values']
         
-        ax.hist(sep_vals, bins=15, alpha=0.7, color=color, edgecolor='black')
-        ax.axvline(0.8, color='red', linestyle='--', linewidth=2)
-        ax.axvline(r['mean_sep'], color='darkgreen', linestyle='-', linewidth=2)
-        ax.set_title(f'{method}\nMean Sep = {r["mean_sep"]:.3f}', fontweight='bold')
-        ax.set_xlabel('Separability')
-        ax.set_ylabel('Count')
-        ax.grid(True, alpha=0.3)
+        fig.add_trace(
+            go.Histogram(
+                x=sep_vals,
+                nbinsx=15,
+                marker=dict(color=COLORS.get(method, '#6C757D'), 
+                           line=dict(color='white', width=1)),
+                opacity=0.8,
+                showlegend=False,
+                hovertemplate='Sep: %{x:.3f}<br>Count: %{y}<extra></extra>'
+            ),
+            row=1, col=i
+        )
+        
+        # Add threshold line
+        fig.add_vline(
+            x=0.8,
+            line=dict(color=COLORS['threshold'], width=2, dash='dash'),
+            row=1, col=i
+        )
+        
+        # Add mean line
+        fig.add_vline(
+            x=results[method]['mean_sep'],
+            line=dict(color='#06A77D', width=2),
+            row=1, col=i
+        )
+        
+        fig.update_xaxes(title_text='Separability', row=1, col=i, range=[0.3, 0.9])
+        fig.update_yaxes(title_text='Count' if i == 1 else '', row=1, col=i)
     
-    # Comparison bar chart
-    ax_comp = fig.add_subplot(gs[1, :])
-    x = np.arange(len(methods))
+    # Row 2: Bar chart comparison
+    x_pos = np.arange(len(methods))
     mean_seps = [results[m]['mean_sep'] for m in methods]
-    percent_mixed = [results[m]['percent_mixed'] for m in methods]
+    percent_mixed = [results[m]['percent_mixed']/100 for m in methods]
     
-    ax_comp.bar(x - 0.2, mean_seps, 0.4, label='Mean Separability', alpha=0.7, color='steelblue')
-    ax_comp.bar(x + 0.2, [p/100 for p in percent_mixed], 0.4, label='% Mixed (normalized)', 
-               alpha=0.7, color='coral')
-    ax_comp.axhline(0.8, color='red', linestyle='--', linewidth=2, label='Threshold (0.8)')
+    for i, (method, mean_sep, pct) in enumerate(zip(methods, mean_seps, percent_mixed)):
+        # Mean separability bars
+        fig.add_trace(
+            go.Bar(
+                x=[method],
+                y=[mean_sep],
+                name='Mean Separability' if i == 0 else '',
+                marker=dict(color=COLORS.get(method, '#6C757D')),
+                opacity=0.7,
+                showlegend=(i == 0),
+                hovertemplate=f'{method}<br>Mean Sep: {mean_sep:.3f}<extra></extra>',
+                legendgroup='sep'
+            ),
+            row=2, col=1
+        )
+        
+        # Percent mixed bars
+        fig.add_trace(
+            go.Bar(
+                x=[method],
+                y=[pct],
+                name='% Mixed (normalized)' if i == 0 else '',
+                marker=dict(color='coral'),
+                opacity=0.7,
+                showlegend=(i == 0),
+                hovertemplate=f'{method}<br>Mixed: {pct*100:.1f}%<extra></extra>',
+                legendgroup='mixed'
+            ),
+            row=2, col=1
+        )
     
-    ax_comp.set_xlabel('Method', fontsize=12)
-    ax_comp.set_ylabel('Value', fontsize=12)
-    ax_comp.set_title('Method Comparison', fontsize=14, fontweight='bold')
-    ax_comp.set_xticks(x)
-    ax_comp.set_xticklabels(methods, rotation=15)
-    ax_comp.legend(fontsize=10)
-    ax_comp.grid(True, alpha=0.3, axis='y')
+    # Threshold line on bar chart
+    fig.add_hline(
+        y=0.8,
+        line=dict(color=COLORS['threshold'], width=2, dash='dash'),
+        row=2, col=1
+    )
     
-    # Save
-    filepath = Path(save_dir) / 'method_comparison.png'
-    plt.savefig(filepath, dpi=150, bbox_inches='tight')
-    plt.close()
+    # Hide other bar chart columns
+    for col in range(2, len(methods)+1):
+        fig.update_xaxes(visible=False, row=2, col=col)
+        fig.update_yaxes(visible=False, row=2, col=col)
     
+    fig.update_xaxes(title_text='<b>Method</b>', row=2, col=1)
+    fig.update_yaxes(title_text='<b>Value</b>', row=2, col=1, range=[0, 1])
+    
+    fig.update_layout(
+        title=dict(
+            text='<b>Method Comparison: Mixed Selectivity Performance</b><br>' +
+                 '<sub>Comparing different neural population generation methods</sub>',
+            x=0.5,
+            xanchor='center',
+            font=dict(size=18)
+        ),
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(family='Arial', size=10),
+        barmode='group',
+        width=350*len(methods),
+        height=900,
+        margin=dict(l=70, r=70, t=120, b=70)
+    )
+    
+    filepath = Path(save_dir) / 'method_comparison.html'
+    fig.write_html(str(filepath))
     print(f"  ✓ Saved: {filepath.name}")
 
 
-def _get_interpretation(mean_sep: float, percent_mixed: float) -> str:
+def _get_interpretation(mean_sep: float, percent_mixed: float, method: str = '') -> str:
     """Generate interpretation text based on results."""
     if mean_sep < 0.5:
-        return (f"Strong non-separability across population.\n"
+        text = (f"Strong non-separability across population.\n"
                 f"      Neurons exhibit robust mixed selectivity,\n"
                 f"      suitable for flexible computation.")
-    elif mean_sep < 0.8:
-        return (f"Moderate mixed selectivity detected.\n"
+    elif mean_sep < 0.65:
+        text = (f"Moderate-strong mixed selectivity detected.\n"
                 f"      Population shows conjunctive encoding\n"
                 f"      of orientation and location.")
+    elif mean_sep < 0.8:
+        text = (f"Moderate mixed selectivity detected.\n"
+                f"      Population shows conjunctive encoding\n"
+                f"      with some separable neurons.")
     else:
-        return (f"Population shows predominantly separable tuning.\n"
+        text = (f"Population shows predominantly separable tuning.\n"
                 f"      Limited evidence of mixed selectivity.\n"
                 f"      Consider using 'direct' method.")
+    
+    # Add method-specific note
+    if method == 'gp_interaction' and mean_sep < 0.7:
+        text += f"\n\n      Note: GP method achieved non-separability\n"
+        text += f"      through parameter coupling alone\n"
+        text += f"      (no artificial conjunction injection)."
+    
+    return text
 
 
 # ========================================
@@ -499,7 +811,7 @@ if __name__ == '__main__':
         n_neurons=50,
         n_orientations=20,
         n_locations=4,
-        method='direct',
+        method='gp_interaction',
         seed=42
     )
     
@@ -511,12 +823,12 @@ if __name__ == '__main__':
     )
     """
     
-    print("\nExample: Running experiment with direct method...")
+    print("\nExample: Running experiment with GP interaction method...")
     results = run_experiment1(
         n_neurons=20,
         n_orientations=20,
         n_locations=4,
-        method='direct',
+        method='gp_interaction',
         plot=True,
         seed=42
     )

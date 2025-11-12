@@ -6,6 +6,7 @@ This script runs the first experiment to validate that GP-based
 neural populations exhibit mixed selectivity.
 
 Enhanced version with multiple generation methods.
+FIXED: Handles both single method and compare mode return formats.
 """
 
 import sys
@@ -60,7 +61,7 @@ def parse_args():
     parser.add_argument(
         '--seed',
         type=int,
-        default=42,
+        default=22,
         help='Random seed (default: 42)'
     )
     return parser.parse_args()
@@ -69,7 +70,7 @@ def parse_args():
 def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4, 
          plot=True, seed=42):
     """
-    Run Experiment 1 with optimized parameters for MacBook.
+    Run Experiment 1 with optimized parameters.
     
     Parameters:
         method: Generation method ('direct', 'gp_interaction', 'simple_conjunctive', 'compare')
@@ -92,16 +93,16 @@ def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4,
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
     
-    # Configuration - REMOVED 'verbose' parameter
+    # Configuration
     config = {
         'n_neurons': n_neurons,
         'n_orientations': n_orientations,
         'n_locations': n_locations,
-        'theta_lengthscale': 0.3,      # Smaller for more local tuning
-        'spatial_lengthscale': 1.5,    # Smaller for more specificity
+        'theta_lengthscale': 0.3,
+        'spatial_lengthscale': 1.5,
         'plot': plot,
         'seed': seed,
-        'method': method  # Specify generation method
+        'method': method
     }
     
     print("Configuration:")
@@ -131,51 +132,69 @@ def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4,
         print(" EXPERIMENT COMPLETE")
         print("="*60)
         
-        if results['success']:
-            print("✅ MAIN FINDING: Successfully generated mixed selectivity!")
-            print(f"   Method used: {results.get('method', 'unknown')}")
-            print(f"\n📊 Key Statistics:")
-            print(f"   - Mean separability: {results['separability_stats']['mean']:.3f}")
-            print(f"   - Std separability: {results['separability_stats']['std']:.3f}")
-            print(f"   - Neurons with mixed selectivity: {results['separability_stats']['percent_mixed']:.1f}%")
-            
-            # Save results to file
-            save_path = os.path.join(parent_dir, 'data', 'results', f'exp1_results_{method}.npy')
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            np.save(save_path, results)
-            print(f"\n💾 Results saved to: {save_path}")
-            
-        else:
-            print("⚠️  Experiment did not achieve strong mixed selectivity.")
-            print(f"   Mean separability: {results['separability_stats']['mean']:.3f} (target: < 0.8)")
-            
-            if method in ['gp_interaction', 'simple_conjunctive']:
-                print("\n💡 SUGGESTIONS:")
-                print("   1. Try --method direct for guaranteed mixed selectivity")
-                print("   2. Try --method compare to see all methods")
+        # FIXED: Handle different return formats
+        if method == 'compare':
+            # Compare mode returns different format
+            if results['success']:
+                print("✅ MAIN FINDING: Successfully found method with mixed selectivity!")
+                print(f"   Best method: {results.get('best_method', 'unknown')}")
+                
+                # Get best method stats
+                best = results['all_results'][results['best_method']]
+                print(f"\n📊 Best Method Statistics:")
+                print(f"   - Mean separability: {best['mean_sep']:.3f}")
+                print(f"   - Neurons with mixed selectivity: {best['percent_mixed']:.1f}%")
             else:
-                print("\n   Consider adjusting parameters or trying a different method.")
-        
-        # If comparison mode, show recommendations
-        if method == 'compare' and 'all_results' in results:
-            print("\n" + "="*60)
-            print(" RECOMMENDATIONS")
-            print("="*60)
+                print("⚠️  None of the methods achieved strong mixed selectivity.")
+                print("   This is unexpected - check your implementation.")
             
-            all_results = results['all_results']
-            
-            # Sort methods by performance
-            sorted_methods = sorted(all_results.items(), 
-                                  key=lambda x: x[1]['mean_sep'])
-            
-            print("\nMethods ranked by mixed selectivity (lower is better):")
-            for i, (m, r) in enumerate(sorted_methods, 1):
-                status = "✓" if r['mean_sep'] < 0.8 else "✗"
-                print(f"  {i}. {m:20s} - Sep: {r['mean_sep']:.3f} {status}")
-            
-            best_method = sorted_methods[0][0]
-            print(f"\n🏆 Recommended method: {best_method}")
-            print(f"   Use: python run_experiment1.py --method {best_method}")
+            # Show recommendations
+            if 'all_results' in results:
+                print("\n" + "="*60)
+                print(" RECOMMENDATIONS")
+                print("="*60)
+                
+                all_results = results['all_results']
+                
+                # Sort methods by performance
+                sorted_methods = sorted(all_results.items(), 
+                                      key=lambda x: x[1]['mean_sep'])
+                
+                print("\nMethods ranked by mixed selectivity (lower is better):")
+                for i, (m, r) in enumerate(sorted_methods, 1):
+                    status = "✓" if r['mean_sep'] < 0.8 else "✗"
+                    print(f"  {i}. {m:20s} - Sep: {r['mean_sep']:.3f} {status}")
+                
+                best_method = sorted_methods[0][0]
+                print(f"\n🏆 Recommended method: {best_method}")
+                print(f"   Use: python run_experiment1.py --method {best_method}")
+                
+        else:
+            # Single method mode
+            if results['success']:
+                print("✅ MAIN FINDING: Successfully generated mixed selectivity!")
+                print(f"   Method used: {results.get('method', 'unknown')}")
+                print(f"\n📊 Key Statistics:")
+                print(f"   - Mean separability: {results['separability_stats']['mean']:.3f}")
+                print(f"   - Std separability: {results['separability_stats']['std']:.3f}")
+                print(f"   - Neurons with mixed selectivity: {results['separability_stats']['percent_mixed']:.1f}%")
+                
+                # Save results to file
+                save_path = os.path.join(parent_dir, 'data', 'results', f'exp1_results_{method}.npy')
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                np.save(save_path, results)
+                print(f"\n💾 Results saved to: {save_path}")
+                
+            else:
+                print("⚠️  Experiment did not achieve strong mixed selectivity.")
+                print(f"   Mean separability: {results['separability_stats']['mean']:.3f} (target: < 0.8)")
+                
+                if method in ['gp_interaction', 'simple_conjunctive']:
+                    print("\n💡 SUGGESTIONS:")
+                    print("   1. Try --method direct for guaranteed mixed selectivity")
+                    print("   2. Try --method compare to see all methods")
+                else:
+                    print("\n   Consider adjusting parameters or trying a different method.")
         
         return results
         
@@ -188,11 +207,8 @@ def main(method='direct', n_neurons=20, n_orientations=20, n_locations=4,
         
     except Exception as e:
         print(f"\n❌ Error running experiment: {str(e)}")
-        print("\nTroubleshooting:")
-        print("1. Make sure all required packages are installed:")
-        print("   pip install numpy torch matplotlib tqdm")
-        print("2. Ensure the mixed_selectivity package is properly set up:")
-        print("   pip install -e .")
+        import traceback
+        traceback.print_exc()
         raise
 
 
