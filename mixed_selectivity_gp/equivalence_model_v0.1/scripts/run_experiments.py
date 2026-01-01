@@ -2,28 +2,29 @@
 """
 Unified Experiment Runner for Mixed Selectivity Analysis
 
-This script runs either:
+This script runs:
   --exp1  Pre-Normalized Response (exponential growth with set size)
-  --exp2  Post-Normalized Response with DN (should be FLAT)
-  --both  Run both experiments with same seed (for direct comparison)
+  --exp2  Post-Normalized Response with DN (parallel to exp1)
+  --exp3  Precision vs Set Size (behavioral prediction with Poisson spiking)
+  --both  Run exp1 and exp2 with same seed (for direct comparison)
 
 USAGE:
     # Run pre-normalized (Experiment 1)
-    python run_experiments.py --exp1 --n_neurons 1
+    python run_experiments.py --exp1 --n_neurons 100
     
     # Run post-normalized with DN (Experiment 2)
-    python run_experiments.py --exp2 --n_neurons 1 --gamma 100
+    python run_experiments.py --exp2 --n_neurons 100 --gamma 100
     
-    # Run both for comparison
-    python run_experiments.py --both --n_neurons 10 --gamma 100
+    # Run precision analysis (Experiment 3) - THE KEY BEHAVIORAL TEST
+    python run_experiments.py --exp3 --n_neurons 10 --n_trials 200
     
-    # Population analysis
+    # Run exp1 + exp2 for comparison
     python run_experiments.py --both --n_neurons 100 --gamma 100
 
-KEY INSIGHT:
+KEY INSIGHTS:
     - Exp1 (Pre-DN): R.mean grows EXPONENTIALLY with set size
-    - Exp2 (Post-DN): R.mean is nearly FLAT (constant) - this is the 
-      metabolic budget constraint that explains WM capacity limits
+    - Exp2 (Post-DN): R.mean scales same as Pre-DN (constant offset)
+    - Exp3 (Precision): PRECISION DECLINES with set size (behavioral prediction)
 
 Author: Mixed Selectivity Project
 Date: December 2025
@@ -44,6 +45,9 @@ from experiments.exp1_pre_normalized import (
 )
 from experiments.exp2_post_normalized import (
     run_experiment2, plot_experiment2
+)
+from experiments.exp3_precision import (
+    run_experiment3, plot_experiment3
 )
 
 import numpy as np
@@ -81,8 +85,10 @@ Key Insight:
                           help='Run Experiment 1: Pre-Normalized Response')
     exp_group.add_argument('--exp2', action='store_true',
                           help='Run Experiment 2: Post-Normalized Response (DN)')
+    exp_group.add_argument('--exp3', action='store_true',
+                          help='Run Experiment 3: Precision vs Set Size (Poisson)')
     exp_group.add_argument('--both', action='store_true',
-                          help='Run both experiments for comparison')
+                          help='Run exp1 + exp2 for comparison')
     
     # Common parameters
     parser.add_argument('--n_neurons', type=int, default=1,
@@ -101,6 +107,12 @@ Key Insight:
                         help='DN gain constant in Hz (default: 100)')
     parser.add_argument('--sigma_sq', type=float, default=1e-6,
                         help='DN semi-saturation constant (default: 1e-6)')
+    
+    # Exp3 parameters (Poisson spiking)
+    parser.add_argument('--n_trials', type=int, default=200,
+                        help='Trials per set size for exp3 (default: 200)')
+    parser.add_argument('--T_d', type=float, default=0.1,
+                        help='Decoding window in seconds (default: 0.1)')
     
     # Output
     parser.add_argument('--save_dir', type=str, default='figures',
@@ -315,6 +327,32 @@ def main():
         
         # Save
         save_path = Path(args.save_dir) / 'exp2_post_norm' / f'exp2_results_{args.n_neurons}neurons.npy'
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(save_path, results, allow_pickle=True)
+        print(f"\n  💾 Results saved to: {save_path}")
+    
+    elif args.exp3:
+        print("\n" + "🧠 "*20)
+        print("  EXPERIMENT 3: PRECISION VS SET SIZE (POISSON)")
+        print("🧠 "*20)
+        
+        results = run_experiment3(
+            n_neurons=args.n_neurons,
+            n_orientations=args.n_orientations,
+            n_trials_per_size=args.n_trials,
+            gamma=args.gamma,
+            sigma_sq=args.sigma_sq,
+            T_d=args.T_d,
+            seed=args.seed,
+            verbose=True
+        )
+        
+        if not args.no_plot:
+            save_dir = Path(args.save_dir) / 'exp3_precision'
+            plot_experiment3(results, save_dir=str(save_dir))
+        
+        # Save
+        save_path = Path(args.save_dir) / 'exp3_precision' / f'exp3_results_{args.n_neurons}neurons.npy'
         save_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(save_path, results, allow_pickle=True)
         print(f"\n  💾 Results saved to: {save_path}")
