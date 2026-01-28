@@ -30,7 +30,7 @@ KEY OUTPUTS:
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
 import argparse
 import time
@@ -39,13 +39,12 @@ import time
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.poisson_spiking import generate_spikes, generate_spikes_multi_trial
+from core.poisson_spike import generate_spikes, generate_spikes_multi_trial
 from core.ml_decoder import (
-    decode_ml_vectorized,
-    decode_ml_batch,
+    decode_ml_single_location,
     compute_circular_error,
-    compute_circular_errors_batch,
-    generate_population_tuning
+    compute_errors_batch,
+    compute_all_metrics
 )
 
 
@@ -82,6 +81,137 @@ def get_config() -> Dict:
         'kappa': args.kappa,
         'output_dir': args.output_dir
     }
+
+
+# =============================================================================
+# HELPER FUNCTIONS (to work with existing ml_decoder)
+# =============================================================================
+
+def generate_von_mises_tuning(
+    theta_values: np.ndarray,
+    preferred: float,
+    kappa: float,
+    amplitude: float,
+    baseline: float = 0.0
+) -> np.ndarray:
+    """
+    Generate von Mises (circular Gaussian) tuning curve.
+    
+    r(θ) = baseline + amplitude × exp(κ × cos(θ - θ_pref))
+    """
+    return baseline + amplitude * np.exp(kappa * np.cos(theta_values - preferred))
+
+
+def generate_population_tuning(
+    theta_values: np.ndarray,
+    n_neurons: int,
+    kappa: float = 2.0,
+    amplitude: float = 50.0,
+    baseline: float = 5.0,
+    rng: Optional[np.random.RandomState] = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate tuning curves for a population with uniformly distributed preferences.
+    
+    Returns:
+        tuning_curves: shape (N, n_θ)
+        preferred_orientations: shape (N,)
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+    
+    preferred_orientations = rng.uniform(-np.pi, np.pi, n_neurons)
+    
+    tuning_curves = np.zeros((n_neurons, len(theta_values)))
+    for i in range(n_neurons):
+        tuning_curves[i] = generate_von_mises_tuning(
+            theta_values, preferred_orientations[i], kappa, amplitude, baseline
+        )
+    
+    return tuning_curves, preferred_orientations
+
+
+def decode_population_ml(
+    spike_counts: np.ndarray,
+    tuning_curves: np.ndarray,
+    theta_values: np.ndarray,
+    T_d: float,
+    gamma: float = 100.0
+) -> Tuple[int, float, np.ndarray]:
+    """
+    ML decode using population of neurons.
+    
+    Parameters:
+        spike_counts: shape (N,) - spike count per neuron
+        tuning_curves: shape (N, n_θ) - tuning curve per neuron
+        theta_values: shape (n_θ,) - orientation values
+        T_d: decoding time window
+        gamma: gain constant
+        
+    Returns:
+        decoded_idx: index of decoded orientation
+        decoded_theta: decoded orientation value
+        log_likelihoods: log-likelihood at each θ
+    """
+    n_theta = len(theta_values)
+    log_likelihoods = np.zeros(n_theta)
+    
+    for j in range(n_theta):
+        # Rates at this candidate θ
+        rates = tuning_curves[:, j]
+        rates = np.maximum(rates, 1e-10)  # Avoid log(0)
+        
+        # Poisson log-likelihood: Σᵢ [nᵢ log(rᵢ) - rᵢ T_d]
+        log_likelihoods[j] = np.sum(
+            spike_counts * np.log(rates) - rates * T_d
+        )
+    
+    decoded_idx = np.argmax(log_likelihoods)
+    decoded_theta = theta_values[decoded_idx]
+    
+    return decoded_idx, decoded_theta, log_likelihoods
+
+
+def decode_batch(
+    spike_counts_batch: np.ndarray,
+    tuning_curves: np.ndarray,
+    theta_values: np.ndarray,
+    T_d: float,
+    gamma: float = 100.0
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Decode multiple trials.
+    
+    Parameters:
+        spike_counts_batch: shape (n_trials, N)
+        
+    Returns:
+        decoded_indices: shape (n_trials,)
+        decoded_thetas: shape (n_trials,)
+    """
+    n_trials = spike_counts_batch.shape[0]
+    decoded_indices = np.zeros(n_trials, dtype=int)
+    decoded_thetas = np.zeros(n_trials)
+    
+    for t in range(n_trials):
+        idx, theta, _ = decode_population_ml(
+            spike_counts_batch[t], tuning_curves, theta_values, T_d, gamma
+        )
+        decoded_indices[t] = idx
+        decoded_thetas[t] = theta
+    
+    return decoded_indices, decoded_thetas
+
+
+def compute_circular_errors(
+    decoded_thetas: np.ndarray,
+    true_theta: float
+) -> np.ndarray:
+    """Compute circular errors for batch of decoded values."""
+    errors = decoded_thetas - true_theta
+    # Wrap to [-π, π]
+    errors = np.arctan2(np.sin(errors), np.cos(errors))
+    return errors
 
 
 # =============================================================================
@@ -201,15 +331,16 @@ def run_experiment_4(config: Dict) -> Dict:
         )
         
         # Decode each trial
-        theta_hat_all, _ = decode_ml_batch(
+        decoded_indices, decoded_thetas = decode_batch(
             spike_counts_batch=spike_counts_all,
             tuning_curves=scaled_tuning,
             theta_values=theta_values,
-            T_d=config['T_d']
+            T_d=config['T_d'],
+            gamma=config['gamma']
         )
         
         # Compute errors
-        errors = compute_circular_errors_batch(theta_hat_all, theta_true)
+        errors = compute_circular_errors(decoded_thetas, theta_true)
         
         # Statistics
         mean_error = np.mean(errors)
@@ -219,7 +350,7 @@ def run_experiment_4(config: Dict) -> Dict:
         # Store results
         results['decoding'][l].update({
             'errors': errors,
-            'theta_hat': theta_hat_all,
+            'theta_hat': decoded_thetas,
             'mean_error': mean_error,
             'std_error': std_error,
             'rmse': rmse,

@@ -71,7 +71,7 @@ def compute_pre_dn_mean_efficient(
         Mean pre-normalized response (averaged over all configurations)
     """
     g = np.exp(f_samples)  # (n_locations, n_orientations)
-    g_bar = np.mean(g[list(subset), :], axis=1)  # (l,)
+    g_bar = np.mean(g[list(subset), :], axis=1)  # (l,) # Average over orientations
     return np.prod(g_bar)
 
 
