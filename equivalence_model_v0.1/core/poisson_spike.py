@@ -16,6 +16,8 @@ KEY PROPERTIES:
     - E[n] = λ              (mean)
     - Var[n] = λ            (variance = mean)
     - SNR = √λ              (signal-to-noise ratio)
+    - CV = 1/√λ             (coefficient of variation)
+    - Fano Factor = 1       (variance/mean ratio)
 
 THE CAPACITY LIMIT CONNECTION:
     Under DN: rate ∝ 1/l  →  λ ∝ 1/l  →  SNR ∝ 1/√l  →  Error ∝ √l
@@ -24,7 +26,22 @@ THE CAPACITY LIMIT CONNECTION:
 """
 
 import numpy as np
-from typing import Optional
+from typing import Optional, Dict, Tuple
+from dataclasses import dataclass
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
+@dataclass
+class PoissonStats:
+    """Statistics from Poisson spike generation."""
+    mean: float
+    variance: float
+    fano_factor: float
+    snr: float
+    cv: float  # coefficient of variation
 
 
 # =============================================================================
@@ -97,77 +114,168 @@ def generate_spikes_multi_trial(
 
 
 # =============================================================================
-# SIGNAL-TO-NOISE RATIO
+# THEORETICAL COMPUTATIONS
 # =============================================================================
 
-def compute_snr(rates: np.ndarray, T_d: float) -> np.ndarray:
+def compute_theoretical_snr(lambda_expected: float) -> float:
     """
-    Compute theoretical SNR for Poisson neurons.
+    Compute theoretical SNR for Poisson process.
     
-    SNR = E[n] / Std[n] = λ / √λ = √λ = √(r × T_d)
-    
-    Parameters
-    ----------
-    rates : np.ndarray
-        Firing rates in Hz, shape (N,)
-    T_d : float
-        Decoding time window in seconds
-        
-    Returns
-    -------
-    snr : np.ndarray
-        Signal-to-noise ratio, shape (N,)
+    SNR = E[n] / Std[n] = λ / √λ = √λ
     """
-    expected_counts = np.maximum(rates * T_d, 1e-10)
-    return np.sqrt(expected_counts)
+    return np.sqrt(max(lambda_expected, 1e-10))
 
 
-# =============================================================================
-# FISHER INFORMATION
-# =============================================================================
+def compute_theoretical_cv(lambda_expected: float) -> float:
+    """
+    Compute theoretical coefficient of variation.
+    
+    CV = Std[n] / E[n] = √λ / λ = 1/√λ
+    """
+    return 1.0 / np.sqrt(max(lambda_expected, 1e-10))
 
-def compute_fisher_information(
-    rates: np.ndarray,
-    rate_derivatives: np.ndarray,
+
+def compute_expected_lambda(
+    gamma: float,
+    N: int,
+    l: int,
     T_d: float
 ) -> float:
     """
-    Compute Fisher Information for Poisson neurons.
+    Compute expected spike count under DN.
     
-    I_F(θ) = T_d × Σᵢ [r'ᵢ(θ)]² / rᵢ(θ)
+    Under DN: total rate = γN, per-item rate = γN/l
+    Expected spikes per item = (γN/l) × T_d
     
     Parameters
     ----------
-    rates : np.ndarray
-        Firing rates r_i(θ), shape (N,)
-    rate_derivatives : np.ndarray
-        Tuning curve slopes dr_i/dθ, shape (N,)
+    gamma : float
+        Gain constant (Hz per neuron)
+    N : int
+        Number of neurons
+    l : int
+        Set size (number of items)
     T_d : float
-        Decoding time window
+        Decoding time window (seconds)
         
     Returns
     -------
-    I_F : float
-        Fisher Information
+    lambda_expected : float
+        Expected spike count
     """
-    rates_safe = np.maximum(rates, 1e-10)
-    return float(T_d * np.sum(rate_derivatives**2 / rates_safe))
+    per_item_rate = gamma * N / l
+    return per_item_rate * T_d
 
 
-def compute_cramer_rao_bound(fisher_information: float) -> float:
+# =============================================================================
+# EMPIRICAL STATISTICS
+# =============================================================================
+
+def compute_empirical_stats(spike_counts: np.ndarray) -> PoissonStats:
     """
-    Compute Cramér-Rao lower bound on estimation variance.
-    
-    Var[θ̂] ≥ 1 / I_F(θ)
+    Compute empirical statistics from spike count array.
     
     Parameters
     ----------
-    fisher_information : float
-        Fisher Information I_F(θ)
+    spike_counts : np.ndarray
+        Spike counts, shape (n_trials,) or (n_trials, N)
         
     Returns
     -------
-    min_variance : float
-        Minimum achievable variance
+    stats : PoissonStats
+        Empirical statistics
     """
-    return 1.0 / (fisher_information + 1e-10)
+    # Flatten if multi-neuron
+    counts = spike_counts.flatten() if spike_counts.ndim > 1 else spike_counts
+    
+    mean = np.mean(counts)
+    variance = np.var(counts, ddof=1)
+    
+    # Avoid division by zero
+    mean_safe = max(mean, 1e-10)
+    
+    return PoissonStats(
+        mean=mean,
+        variance=variance,
+        fano_factor=variance / mean_safe,
+        snr=mean / np.sqrt(variance) if variance > 0 else 0.0,
+        cv=np.sqrt(variance) / mean_safe
+    )
+
+
+def compute_population_stats(
+    spike_counts: np.ndarray,
+    axis: int = 0
+) -> Dict[str, np.ndarray]:
+    """
+    Compute statistics across trials for each neuron.
+    
+    Parameters
+    ----------
+    spike_counts : np.ndarray
+        Shape (n_trials, N)
+    axis : int
+        Axis over which to compute (0 = across trials)
+        
+    Returns
+    -------
+    stats : dict
+        Dictionary with per-neuron statistics
+    """
+    means = np.mean(spike_counts, axis=axis)
+    variances = np.var(spike_counts, axis=axis, ddof=1)
+    
+    means_safe = np.maximum(means, 1e-10)
+    
+    return {
+        'means': means,
+        'variances': variances,
+        'fano_factors': variances / means_safe,
+        'snr': means / np.sqrt(np.maximum(variances, 1e-10)),
+        'cv': np.sqrt(variances) / means_safe
+    }
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def create_heterogeneous_rates(
+    total_rate: float,
+    n_neurons: int,
+    heterogeneity: float = 2.0,
+    rng: Optional[np.random.RandomState] = None
+) -> np.ndarray:
+    """
+    Create heterogeneous firing rates that sum to total_rate.
+    
+    Uses gamma distribution to create realistic rate heterogeneity.
+    
+    Parameters
+    ----------
+    total_rate : float
+        Total firing rate (sum across neurons)
+    n_neurons : int
+        Number of neurons
+    heterogeneity : float
+        Shape parameter (higher = more homogeneous)
+    rng : np.random.RandomState, optional
+        Random number generator
+        
+    Returns
+    -------
+    rates : np.ndarray
+        Firing rates, shape (n_neurons,), sum = total_rate
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+    
+    mean_rate = total_rate / n_neurons
+    scale = mean_rate / heterogeneity
+    
+    rates = rng.gamma(heterogeneity, scale, size=n_neurons)
+    
+    # Normalize to enforce exact total
+    rates = rates * (total_rate / np.sum(rates))
+    
+    return rates

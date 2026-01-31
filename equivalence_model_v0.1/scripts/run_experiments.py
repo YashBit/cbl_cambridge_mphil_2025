@@ -78,8 +78,9 @@ def run_single_experiment(
         Contains status, timing, and output path
     """
     
-    # Create output directory with descriptive name
-    output_dir = f"{output_base}/exp{exp_num}/N{n_neurons}_seed{seed}"
+    # Create output directory with descriptive name including date
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"{output_base}/exp{exp_num}_seed{seed}_{timestamp}/N{n_neurons}"
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     start_time = time.time()
@@ -229,7 +230,7 @@ def run_batch(
                 
                 results.append(result)
                 
-                status_icon = "✓" if result['status'] == 'success' else "✗"
+                status_icon = "âœ“" if result['status'] == 'success' else "âœ—"
                 print(f"\n{status_icon} Completed in {result['elapsed_seconds']:.1f}s")
     
     batch_elapsed = time.time() - batch_start
@@ -255,15 +256,15 @@ def run_batch(
     print("\n" + "=" * 70)
     print("BATCH COMPLETE")
     print("=" * 70)
-    print(f"\n📊 Summary:")
+    print(f"\nðŸ“Š Summary:")
     print(f"   Total runs:    {total_runs}")
     print(f"   Successful:    {summary['successful']}")
     print(f"   Failed:        {summary['failed']}")
     print(f"   Total time:    {batch_elapsed/60:.1f} minutes")
-    print(f"\n📁 Output: {summary_dir}")
-    print(f"📄 Summary: {summary_file}")
+    print(f"\nðŸ“ Output: {summary_dir}")
+    print(f"ðŸ“„ Summary: {summary_file}")
     
-    print(f"\n⏱️  Timing by experiment:")
+    print(f"\nâ±ï¸  Timing by experiment:")
     for exp_num in experiments:
         exp_results = [r for r in results if r['experiment'] == exp_num and r['status'] == 'success']
         if exp_results:
@@ -272,7 +273,7 @@ def run_batch(
     
     errors = [r for r in results if r['status'] == 'error']
     if errors:
-        print(f"\n⚠️  Errors ({len(errors)}):")
+        print(f"\nâš ï¸  Errors ({len(errors)}):")
         for e in errors:
             print(f"   Exp {e['experiment']}, N={e['n_neurons']}, seed={e['seed']}: {e['error']}")
     
@@ -404,10 +405,10 @@ Examples:
         )
         
         if result['status'] == 'success':
-            print(f"\n✓ Experiment {experiments[0]} complete ({result['elapsed_seconds']:.1f}s)")
+            print(f"\nâœ“ Experiment {experiments[0]} complete ({result['elapsed_seconds']:.1f}s)")
             print(f"  Output: {result['output_dir']}")
         else:
-            print(f"\n✗ Experiment {experiments[0]} failed: {result.get('error', 'Unknown error')}")
+            print(f"\nâœ— Experiment {experiments[0]} failed: {result.get('error', 'Unknown error')}")
             if 'traceback' in result:
                 print(result['traceback'])
     else:

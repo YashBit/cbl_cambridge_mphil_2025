@@ -356,10 +356,7 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     blurb_post = (
         "ACTIVITY CAP THEOREM\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Σᵢ rᵢᵖᵒˢᵗ = γN (constant!)\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "DN enforces fixed budget\n"
-        "regardless of set size"
+        "Σᵢ rᵢᵖᵒˢᵗ = γN (constant!)"
     )
     ax2.text(0.02, 0.98, blurb_post, transform=ax2.transAxes, fontsize=10,
              verticalalignment='top', horizontalalignment='left',
@@ -368,6 +365,18 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
              family='monospace')
     
     plt.tight_layout()
+    
+    # FIGURE DESCRIPTION at bottom
+    description = (
+        f"Figure: Total population activity before and after divisive normalization. "
+        f"For subset S with fixed orientations θ, pre-DN: Σ_i r_i^pre(S,θ) = Σ_i ∏_{{k∈S}} g_i(θ_k) grows with |S|. "
+        f"(Left) Pre-DN activity increases as more locations contribute to the product. "
+        f"(Right) Post-DN: Σ_i r_i^post(S,θ) = γN = {theoretical:,.0f} Hz (constant), "
+        f"because DN divides each neuron's response by the population mean, enforcing a fixed metabolic budget."
+    )
+    fig.text(0.5, -0.02, description, ha='center', va='top', fontsize=9,
+             wrap=True, style='italic',
+             bbox=dict(boxstyle='round', facecolor='white', edgecolor='gray', alpha=0.9))
     plt.savefig(output_path / f'exp2_pre_vs_post_N{N}.png', dpi=150, bbox_inches='tight')
     if show_plot:
         plt.show()
@@ -453,22 +462,20 @@ def _plot_single_neuron_responses(results: Dict, output_path: Path, show_plot: b
     cbar.set_ticks([0, N//2, N-1])
     cbar.set_ticklabels(['Losers', 'Middle', 'Winners'])
     
-    # EMBEDDED BLURB (key insight box)
-    blurb = (
-        "Winner-take-all under DN:\n"
-        f"• Total budget fixed at γN = {gamma*N:,.0f} Hz\n"
-        f"• Mean stays constant at γ = {gamma:.0f} Hz\n"
-        f"• But variance grows {pop_std[-1]/pop_std[0]:.1f}× (l={set_sizes[0]}→l={set_sizes[-1]})\n"
-        "• Winners (red): high tuning everywhere\n"
-        "• Losers (blue): one bad location ruins all"
-    )
-    ax.text(0.02, 0.98, blurb, transform=ax.transAxes, fontsize=10,
-            verticalalignment='top', horizontalalignment='left',
-            bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', 
-                      edgecolor='orange', alpha=0.95, linewidth=2),
-            fontfamily='sans-serif', linespacing=1.4)
-    
     plt.tight_layout()
+    
+    # FIGURE DESCRIPTION at bottom
+    description = (
+        f"Figure: Each line shows neuron i's average post-DN response across all C({config['n_locations']},l) subsets S. "
+        f"For each subset S ⊂ {{1,...,{config['n_locations']}}}, orientations θ = (θ₁,...,θ_L) are fixed (sampled once at experiment start, then held constant). "
+        f"Pre-DN response: r_i^pre(S,θ) = ∏_{{k∈S}} g_i(θ_k), where g_i(θ) = exp(f_i(θ)) is neuron i's tuning at location k. "
+        f"Post-DN response: r_i^post(S,θ) = γ · r_i^pre(S,θ) / [σ² + N⁻¹ Σ_j r_j^pre(S,θ)]. "
+        f"The population mean (yellow) remains at γ = {gamma:.0f} Hz, but individual neurons diverge as set size increases—"
+        f"neurons with high tuning at all locations in S dominate the fixed budget γN = {gamma*N:,.0f} Hz."
+    )
+    fig.text(0.5, -0.02, description, ha='center', va='top', fontsize=9,
+             wrap=True, style='italic',
+             bbox=dict(boxstyle='round', facecolor='white', edgecolor='gray', alpha=0.9))
     plt.savefig(output_path / f'exp2_single_neuron_band_N{N}.png', dpi=150, bbox_inches='tight', facecolor='white')
     if show_plot:
         plt.show()
@@ -536,17 +543,20 @@ def _plot_single_neuron_responses(results: Dict, output_path: Path, show_plot: b
         ax2.text(l, s + pop_std.max() * 0.02, f'{s:.1f}', ha='center', va='bottom', 
                  fontsize=12, fontweight='bold')
     
-    # Embedded blurb for right panel
-    blurb_right = (
-        "Fixed budget → unequal shares\n"
-        f"Std grows {pop_std[-1]/pop_std[0]:.1f}× from l={set_sizes[0]} to l={set_sizes[-1]}"
-    )
-    ax2.text(0.98, 0.98, blurb_right, transform=ax2.transAxes, fontsize=10,
-             verticalalignment='top', horizontalalignment='right',
-             bbox=dict(boxstyle='round', facecolor='lightyellow', 
-                       alpha=0.95, edgecolor='orange', linewidth=1.5))
-    
     plt.tight_layout()
+    
+    # FIGURE DESCRIPTION at bottom
+    description = (
+        f"Figure: (Left) Each neuron's average response r_i^post(S,θ) averaged over all subsets S of size l. "
+        f"Orientations θ = (θ₁,...,θ_L) are sampled once and fixed throughout. "
+        f"Post-DN formula: r_i^post(S,θ) = γ · ∏_{{k∈S}} g_i(θ_k) / [σ² + N⁻¹ Σ_j ∏_{{k∈S}} g_j(θ_k)]. "
+        f"Colors indicate response magnitude at l={set_sizes[-1]}. Population mean stays at γ = {gamma:.0f} Hz. "
+        f"(Right) Standard deviation across neurons grows {pop_std[-1]/pop_std[0]:.1f}-fold as set size increases, "
+        f"because the product over more locations amplifies tuning differences between neurons."
+    )
+    fig.text(0.5, -0.02, description, ha='center', va='top', fontsize=9,
+             wrap=True, style='italic',
+             bbox=dict(boxstyle='round', facecolor='white', edgecolor='gray', alpha=0.9))
     plt.savefig(output_path / f'exp2_response_summary_N{N}.png', dpi=150, bbox_inches='tight', facecolor='white')
     if show_plot:
         plt.show()
