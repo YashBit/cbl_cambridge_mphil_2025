@@ -1,19 +1,22 @@
 """
-Experiment 1: Pre-Normalized Response Analysis
+Experiment 1: Pre-Normalized Response Analysis (ENHANCED PLOTTING)
 
-This experiment analyzes the RAW (pre-normalized) neural responses
-from the GP-based mixed selectivity framework.
+This experiment analyzes RAW (pre-normalized) neural responses from the
+GP-based mixed selectivity framework, BEFORE divisive normalization.
+
+PURPOSE:
+    - Establish baseline scaling of neural activity with set size
+    - Demonstrate exponential growth: R ∝ ḡ^l
+    - Show why DN is necessary (activity explodes without it)
 
 KEY OUTPUT:
-- R.mean vs Set Size (shows exponential growth)
-- Distribution of R.mean across neurons
-- Scaling analysis (fold-change between set sizes)
+    - R.mean vs Set Size (exponential growth)
+    - Per-item activity measures
+    - Separability analysis (mixed selectivity verification)
 
-The pre-normalized response is: R = exp(Σ_k f_k(θ_k))
-where f_k are GP samples for each active location.
-
-This grows EXPONENTIALLY with set size because:
-- More locations → more terms in sum → larger exponent → exponential growth
+MECHANISM TESTED:
+    Pre-normalized response R = exp(Σ_k f_k(θ_k)) grows exponentially
+    because more locations → more terms in sum → larger exponent
 
 Author: Mixed Selectivity Project
 Date: December 2025
@@ -26,430 +29,558 @@ from typing import Dict, List, Optional
 from tqdm import tqdm
 import time
 
-import matplotlib.pyplot as plt
-import seaborn as sns
+# Import from core modules
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from core.gaussian_process import (
+    generate_neuron_population,
+    compute_pre_normalized_response
+)
+from core.divisive_normalization import (
+    compute_total_activity,
+    compute_per_item_activity
+)
+from analysis.separability import (
+    analyze_population_separability,
+    summarize_separability
+)
 
 
 # ============================================================================
-# GP GENERATION (shared with exp2)
+# EXPERIMENT CONFIGURATION
 # ============================================================================
 
-def generate_neuron_gp_samples(
-    n_orientations: int,
-    total_locations: int,
-    theta_lengthscale: float,
-    lengthscale_variability: float,
-    random_state: np.random.RandomState
-) -> Dict:
-    """
-    Generate GP samples for a single neuron.
-    
-    Returns dictionary with:
-        - lengthscale_vector: (total_locations,)
-        - f_samples: (total_locations, n_theta)
-        - orientations: (n_theta,)
-    """
-    n_theta = n_orientations
-    orientations = np.linspace(-np.pi, np.pi, n_theta)
-    
-    # Location-dependent lengthscales (source of mixed selectivity)
-    random_factors = 1.0 + lengthscale_variability * random_state.randn(total_locations)
-    random_factors = np.abs(random_factors)
-    lengthscale_vector = theta_lengthscale * random_factors
-    
-    # Sample GP functions
-    f_samples = np.zeros((total_locations, n_theta))
-    
-    for loc in range(total_locations):
-        lengthscale = lengthscale_vector[loc]
-        
-        # Build covariance matrix (periodic kernel)
-        K = np.zeros((n_theta, n_theta))
-        for i in range(n_theta):
-            for j in range(n_theta):
-                dist = np.abs(orientations[i] - orientations[j])
-                dist = np.minimum(dist, 2*np.pi - dist)
-                K[i, j] = np.exp(-dist**2 / (2 * lengthscale**2))
-        
-        K += 1e-6 * np.eye(n_theta)
-        L = np.linalg.cholesky(K)
-        
-        z = random_state.randn(n_theta)
-        f_loc = L @ z
-        
-        gain = 1.0 + 0.2 * random_state.randn()
-        f_samples[loc, :] = f_loc * np.abs(gain)
-    
-    return {
-        'lengthscale_vector': lengthscale_vector,
-        'f_samples': f_samples,
-        'orientations': orientations,
-        'n_theta': n_theta
-    }
+DEFAULT_CONFIG = {
+    'n_orientations': 10,
+    'total_locations': 8,
+    'subset_sizes': [2, 4, 6, 8],
+    'base_lengthscale': 0.3,
+    'lengthscale_variability': 0.5,
+    'gain_variability': 0.2
+}
 
 
-def compute_pre_normalized_responses(
-    f_samples: np.ndarray,
+# ============================================================================
+# CORE EXPERIMENT FUNCTIONS
+# ============================================================================
+
+def compute_pre_normalized_statistics(
+    neuron: Dict,
     subset_sizes: List[int],
-    verbose: bool = False
+    show_progress: bool = False
 ) -> Dict:
     """
-    Compute PRE-NORMALIZED response R = exp(G) for all subsets.
+    Compute pre-normalized response statistics for a single neuron.
     
-    G = Σ_k f_k(θ_k) is the log-rate tensor
-    R = exp(G) is the pre-normalized response
-    
-    Returns R.mean for each set size l.
+    Parameters
+    ----------
+    neuron : Dict
+        Neuron data from generate_neuron_tuning_curves
+    subset_sizes : List[int]
+        List of set sizes to analyze
+    show_progress : bool
+        Show progress bar for subsets
+        
+    Returns
+    -------
+    dict with statistics for each set size
     """
-    total_locations, n_theta = f_samples.shape
+    f_samples = neuron['f_samples']
+    total_locations = f_samples.shape[0]
+    n_theta = f_samples.shape[1]
+    
     results = {}
     
     for l in subset_sizes:
         subsets = list(combinations(range(total_locations), l))
-        subset_means = []
         
-        iterator = tqdm(subsets, desc=f"    l={l}", leave=False) if verbose else subsets
+        subset_means = []
+        subset_per_item = []
+        
+        iterator = tqdm(subsets, desc=f"l={l}", leave=False) if show_progress else subsets
         
         for subset in iterator:
-            f_subset = [f_samples[loc, :] for loc in subset]
+            # Compute pre-normalized response
+            R_pre = compute_pre_normalized_response(f_samples, subset)
             
-            # Build log-rate tensor G
-            G = np.zeros([n_theta] * l)
-            for dim_idx, f_loc in enumerate(f_subset):
-                shape = [1] * l
-                shape[dim_idx] = n_theta
-                G = G + f_loc.reshape(shape)
+            # Statistics
+            total = compute_total_activity(R_pre)
+            per_item = compute_per_item_activity(R_pre, l)
             
-            # Pre-normalized response: R = exp(G)
-            R = np.exp(G)
-            subset_means.append(np.mean(R))
+            subset_means.append(total)
+            subset_per_item.append(per_item)
         
         results[l] = {
-            'all_means': np.array(subset_means),
             'R_mean': np.mean(subset_means),
             'R_std': np.std(subset_means),
+            'R_all': np.array(subset_means),
+            'per_item_mean': np.mean(subset_per_item),
+            'per_item_std': np.std(subset_per_item),
+            'per_item_all': np.array(subset_per_item),
             'n_subsets': len(subsets)
         }
     
     return results
 
 
-# ============================================================================
-# MAIN EXPERIMENT
-# ============================================================================
-
 def run_experiment1(
     n_neurons: int = 1,
-    n_orientations: int = 10,
-    total_locations: int = 8,
-    subset_sizes: List[int] = [2, 4, 6, 8],
-    theta_lengthscale: float = 0.3,
-    lengthscale_variability: float = 0.5,
     seed: int = 22,
+    config: Optional[Dict] = None,
     verbose: bool = True
 ) -> Dict:
     """
     Run Experiment 1: Pre-Normalized Response Analysis.
     
-    For n_neurons=1: Single neuron analysis
-    For n_neurons>1: Population average
+    Parameters
+    ----------
+    n_neurons : int
+        Number of neurons to generate
+    seed : int
+        Random seed for reproducibility
+    config : Dict, optional
+        Configuration overrides
+    verbose : bool
+        Print progress and results
+        
+    Returns
+    -------
+    dict with complete experiment results
     """
-    master_rng = np.random.RandomState(seed)
+    # Merge config
+    cfg = {**DEFAULT_CONFIG, **(config or {})}
     
     if verbose:
         print("\n" + "="*70)
         print("  EXPERIMENT 1: PRE-NORMALIZED RESPONSE ANALYSIS")
         print("="*70)
-        print(f"\n  📊 Configuration:")
-        print(f"     n_neurons:       {n_neurons}")
-        print(f"     n_orientations:  {n_orientations}")
-        print(f"     total_locations: {total_locations}")
-        print(f"     subset_sizes:    {subset_sizes}")
-        print(f"     λ_base:          {theta_lengthscale}")
-        print(f"     σ_λ:             {lengthscale_variability}")
-        print(f"     seed:            {seed}")
-    
-    # Storage
-    all_neuron_data = []
-    population_R_means = {l: [] for l in subset_sizes}
+        print(f"\n  Configuration:")
+        print(f"    n_neurons:       {n_neurons}")
+        print(f"    n_orientations:  {cfg['n_orientations']}")
+        print(f"    total_locations: {cfg['total_locations']}")
+        print(f"    subset_sizes:    {cfg['subset_sizes']}")
+        print(f"    λ_base:          {cfg['base_lengthscale']}")
+        print(f"    σ_λ:             {cfg['lengthscale_variability']}")
+        print(f"    seed:            {seed}")
     
     start_time = time.time()
     
+    # ────────────────────────────────────────────────────────────────────────
+    # STEP 1: Generate Neuron Population
+    # ────────────────────────────────────────────────────────────────────────
     if verbose:
         print(f"\n  {'─'*60}")
-        print(f"  GENERATING {n_neurons} NEURON(S)")
+        print(f"  STEP 1: Generating {n_neurons} neuron(s)")
         print(f"  {'─'*60}")
     
-    # Progress bar for multiple neurons
-    if n_neurons > 1 and verbose:
-        neuron_iter = tqdm(range(n_neurons), desc="  Neurons", unit="neuron")
-    else:
-        neuron_iter = range(n_neurons)
+    population = generate_neuron_population(
+        n_neurons=n_neurons,
+        n_orientations=cfg['n_orientations'],
+        n_locations=cfg['total_locations'],
+        base_lengthscale=cfg['base_lengthscale'],
+        lengthscale_variability=cfg['lengthscale_variability'],
+        seed=seed,
+        gain_variability=cfg['gain_variability']
+    )
     
-    for neuron_idx in neuron_iter:
-        neuron_seed = master_rng.randint(0, 2**31)
-        neuron_rng = np.random.RandomState(neuron_seed)
-        
-        # Generate GP samples
-        neuron_data = generate_neuron_gp_samples(
-            n_orientations=n_orientations,
-            total_locations=total_locations,
-            theta_lengthscale=theta_lengthscale,
-            lengthscale_variability=lengthscale_variability,
-            random_state=neuron_rng
+    if verbose and n_neurons == 1:
+        print(f"\n    Lengthscales: {population[0]['lengthscales']}")
+        ls = population[0]['lengthscales']
+        print(f"    Range: [{ls.min():.3f}, {ls.max():.3f}], Ratio: {ls.max()/ls.min():.2f}×")
+    
+    # ────────────────────────────────────────────────────────────────────────
+    # STEP 2: Compute Pre-Normalized Responses
+    # ────────────────────────────────────────────────────────────────────────
+    if verbose:
+        print(f"\n  {'─'*60}")
+        print(f"  STEP 2: Computing pre-normalized responses")
+        print(f"  {'─'*60}")
+    
+    all_neuron_results = []
+    population_stats = {l: {'R_means': [], 'per_item_means': []} for l in cfg['subset_sizes']}
+    
+    neuron_iter = tqdm(population, desc="  Neurons", unit="neuron") if (n_neurons > 1 and verbose) else population
+    
+    for neuron in neuron_iter:
+        neuron_stats = compute_pre_normalized_statistics(
+            neuron,
+            cfg['subset_sizes'],
+            show_progress=(n_neurons == 1 and verbose)
         )
         
-        # Print single neuron details
-        if n_neurons == 1 and verbose:
-            print(f"\n  STAGE 1: Location-Dependent Lengthscales")
-            print(f"  λ_vector: [{', '.join([f'{v:.3f}' for v in neuron_data['lengthscale_vector']])}]")
-            lv = neuron_data['lengthscale_vector']
-            print(f"  Range: [{lv.min():.3f}, {lv.max():.3f}], Ratio: {lv.max()/lv.min():.2f}×")
-            
-            print(f"\n  STAGE 2: GP Samples")
-            fs = neuron_data['f_samples']
-            print(f"  Shape: {fs.shape}")
-            print(f"  Range: [{fs.min():.3f}, {fs.max():.3f}]")
-            
-            print(f"\n  STAGE 3: Pre-Normalized Responses")
-        
-        # Compute pre-normalized responses
-        pre_norm = compute_pre_normalized_responses(
-            f_samples=neuron_data['f_samples'],
-            subset_sizes=subset_sizes,
-            verbose=(n_neurons == 1 and verbose)
-        )
-        
-        # Store
-        all_neuron_data.append({
-            'neuron_idx': neuron_idx,
-            'lengthscale_vector': neuron_data['lengthscale_vector'],
-            'f_samples': neuron_data['f_samples'],
-            'pre_norm': pre_norm
+        all_neuron_results.append({
+            'neuron_idx': neuron['neuron_idx'],
+            'lengthscales': neuron['lengthscales'],
+            'statistics': neuron_stats
         })
         
-        for l in subset_sizes:
-            population_R_means[l].append(pre_norm[l]['R_mean'])
+        # Accumulate population statistics
+        for l in cfg['subset_sizes']:
+            population_stats[l]['R_means'].append(neuron_stats[l]['R_mean'])
+            population_stats[l]['per_item_means'].append(neuron_stats[l]['per_item_mean'])
+    
+    # ────────────────────────────────────────────────────────────────────────
+    # STEP 3: Separability Analysis
+    # ────────────────────────────────────────────────────────────────────────
+    if verbose:
+        print(f"\n  {'─'*60}")
+        print(f"  STEP 3: Analyzing mixed selectivity")
+        print(f"  {'─'*60}")
+    
+    # FIX: summarize_separability expects population, not separability_results
+    separability_summary = summarize_separability(population)
+    
+    if verbose:
+        # FIX: Access nested structure correctly
+        print(f"\n    Mean separability: {separability_summary['separability']['mean']:.3f}")
+        print(f"    Mixed selectivity: {separability_summary['classification']['percent_mixed']:.1f}%")
     
     elapsed = time.time() - start_time
     
-    # Aggregate results
-    results = {
-        'experiment': 'pre_normalized',
-        'n_neurons': n_neurons,
-        'config': {
-            'n_orientations': n_orientations,
-            'total_locations': total_locations,
-            'subset_sizes': subset_sizes,
-            'theta_lengthscale': theta_lengthscale,
-            'lengthscale_variability': lengthscale_variability,
-            'seed': seed
-        },
-        'neuron_data': all_neuron_data,
-        'population_summary': {},
-        'timing': {'total_seconds': elapsed, 'per_neuron': elapsed / n_neurons}
-    }
+    # Compute population summary
+    population_summary = {}
+    for l in cfg['subset_sizes']:
+        R_means = np.array(population_stats[l]['R_means'])
+        per_item_means = np.array(population_stats[l]['per_item_means'])
+        
+        population_summary[l] = {
+            'R_mean': np.mean(R_means) if n_neurons > 1 else R_means[0],
+            'R_std': np.std(R_means) if n_neurons > 1 else 0.0,
+            'R_all': R_means,
+            'per_item_mean': np.mean(per_item_means) if n_neurons > 1 else per_item_means[0],
+            'per_item_std': np.std(per_item_means) if n_neurons > 1 else 0.0,
+            'per_item_all': per_item_means,
+            'n_subsets': len(list(combinations(range(cfg['total_locations']), l)))
+        }
     
-    # Population summary
+    # ────────────────────────────────────────────────────────────────────────
+    # STEP 5: Print Results
+    # ────────────────────────────────────────────────────────────────────────
     if verbose:
         print(f"\n  {'─'*60}")
-        print(f"  RESULTS: PRE-NORMALIZED R.mean")
+        print(f"  RESULTS: Pre-Normalized Response")
         print(f"  {'─'*60}")
         
-        header = "  " + f"{'l':<5} {'R.mean':<18}"
+        header = f"\n  {'l':<5} {'R.mean':<18} {'Per-Item':<18} {'# Subsets':<12}"
         if n_neurons > 1:
-            header += f" {'Std':<18}"
-        header += f" {'# Subsets':<12}"
+            header = f"\n  {'l':<5} {'R.mean (avg)':<18} {'R.std':<15} {'Per-Item':<18} {'# Subsets':<12}"
         print(header)
-        print("  " + "-"*55)
-    
-    for l in subset_sizes:
-        values = np.array(population_R_means[l])
+        print("  " + "-"*65)
         
-        if n_neurons == 1:
-            summary_value = values[0]
-        else:
-            summary_value = np.mean(values)
+        for l in cfg['subset_sizes']:
+            ps = population_summary[l]
+            if n_neurons == 1:
+                print(f"  {l:<5} {ps['R_mean']:<18.4e} {ps['per_item_mean']:<18.4e} {ps['n_subsets']:<12}")
+            else:
+                print(f"  {l:<5} {ps['R_mean']:<18.4e} {ps['R_std']:<15.4e} {ps['per_item_mean']:<18.4e} {ps['n_subsets']:<12}")
         
-        results['population_summary'][l] = {
-            'R_mean': summary_value,
-            'all_values': values,
-            'std': np.std(values) if n_neurons > 1 else 0.0,
-            'n_subsets': len(list(combinations(range(total_locations), l)))
-        }
-        
-        if verbose:
-            line = f"  {l:<5} {summary_value:<18.4e}"
-            if n_neurons > 1:
-                line += f" {np.std(values):<18.4e}"
-            line += f" {results['population_summary'][l]['n_subsets']:<12}"
-            print(line)
-    
-    # Scaling analysis
-    if verbose:
+        # Scaling analysis
         print(f"\n  SCALING ANALYSIS:")
-        for i in range(len(subset_sizes) - 1):
-            l1, l2 = subset_sizes[i], subset_sizes[i+1]
-            r1 = results['population_summary'][l1]['R_mean']
-            r2 = results['population_summary'][l2]['R_mean']
+        for i in range(len(cfg['subset_sizes']) - 1):
+            l1, l2 = cfg['subset_sizes'][i], cfg['subset_sizes'][i+1]
+            r1 = population_summary[l1]['R_mean']
+            r2 = population_summary[l2]['R_mean']
             fold = r2 / (r1 + 1e-10)
             print(f"    l={l1} → l={l2}: {fold:.2f}× increase")
         
         # Overall
-        r_first = results['population_summary'][subset_sizes[0]]['R_mean']
-        r_last = results['population_summary'][subset_sizes[-1]]['R_mean']
-        print(f"\n    Overall (l={subset_sizes[0]} → l={subset_sizes[-1]}): {r_last/r_first:.2f}× increase")
+        r_first = population_summary[cfg['subset_sizes'][0]]['R_mean']
+        r_last = population_summary[cfg['subset_sizes'][-1]]['R_mean']
+        print(f"\n    Overall (l={cfg['subset_sizes'][0]} → l={cfg['subset_sizes'][-1]}): "
+              f"{r_last/r_first:.2f}× increase")
         
         print(f"\n  ⏱️  Time: {elapsed:.2f}s")
     
-    return results
+    # ────────────────────────────────────────────────────────────────────────
+    # Return Results
+    # ────────────────────────────────────────────────────────────────────────
+    return {
+        'experiment': 'pre_normalized',
+        'n_neurons': n_neurons,
+        'seed': seed,
+        'config': cfg,
+        'population': population,
+        'neuron_results': all_neuron_results,
+        'population_summary': population_summary,
+        'separability': separability_summary,
+        'timing': {
+            'total_seconds': elapsed,
+            'per_neuron': elapsed / n_neurons
+        }
+    }
 
 
 # ============================================================================
-# PLOTTING
+# ENHANCED PLOTTING
 # ============================================================================
 
 def plot_experiment1(
     results: Dict,
     save_dir: str = 'figures/exp1_pre_norm',
     show_plot: bool = True
-) -> Dict[str, plt.Figure]:
+) -> Dict:
     """
-    Create plots for Experiment 1 (Pre-Normalized).
+    Create ENHANCED plots for Experiment 1 with detailed annotations.
     
     Plots:
-    1. Set size vs R.mean (log scale) - shows exponential growth
-    2. Set size vs R.mean (linear scale)
-    3. Distribution across neurons (if n_neurons > 1)
+    1. R.mean vs Set Size (log scale) - with scaling factors, theory, config
+    2. Per-Item Activity vs Set Size - with scaling factors
+    3. Separability distribution
     """
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from scipy import stats
+    
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     
     n_neurons = results['n_neurons']
-    population_summary = results['population_summary']
-    config = results['config']
-    subset_sizes = config['subset_sizes']
+    seed = results['seed']
+    cfg = results['config']
+    pop_summary = results['population_summary']
+    subset_sizes = results['config']['subset_sizes']
+    separability = results['separability']
     
-    R_means = [population_summary[l]['R_mean'] for l in subset_sizes]
+    R_means = [pop_summary[l]['R_mean'] for l in subset_sizes]
+    R_stds = [pop_summary[l]['R_std'] for l in subset_sizes]
+    per_item_means = [pop_summary[l]['per_item_mean'] for l in subset_sizes]
+    per_item_stds = [pop_summary[l]['per_item_std'] for l in subset_sizes]
+    
+    # Compute scaling factors
+    scaling_factors = []
+    for i in range(len(subset_sizes) - 1):
+        fold = R_means[i+1] / (R_means[i] + 1e-10)
+        scaling_factors.append(fold)
+    overall_scaling = R_means[-1] / (R_means[0] + 1e-10)
+    
+    # Estimate effective gain (ḡ) from exponential fit: R ≈ ḡ^l
+    # log(R) = l * log(ḡ) => fit linear regression
+    log_R = np.log(R_means)
+    slope, intercept, r_value, p_value, std_err = stats.linregress(subset_sizes, log_R)
+    g_bar_estimated = np.exp(slope)  # effective per-location gain
     
     figures = {}
+    sns.set_style("whitegrid")
+    neuron_str = "1 neuron" if n_neurons == 1 else f"{n_neurons} neurons (avg)"
     
     print(f"\n  {'='*60}")
-    print(f"  CREATING PLOTS")
+    print(f"  CREATING ENHANCED PLOTS")
     print(f"  {'='*60}")
     
-    sns.set_style("whitegrid")
-    
-    # ========================================
-    # PLOT 1: Log Scale
-    # ========================================
-    fig1, ax1 = plt.subplots(figsize=(10, 7))
-    
+    # ────────────────────────────────────────────────────────────────────────
+    # PLOT 1: R.mean vs Set Size (ENHANCED)
+    # ────────────────────────────────────────────────────────────────────────
+    fig1, ax1 = plt.subplots(figsize=(12, 9))
     ax1.set_yscale('log')
     
-    ax1.plot(subset_sizes, R_means, 'o-', linewidth=2.5, markersize=12,
-             color='#E74C3C', label='Pre-Normalized R.mean')
-    ax1.scatter(subset_sizes, R_means, s=200, c='#C0392B',
-                alpha=0.7, edgecolors='white', linewidths=2, zorder=5)
+    # Main data line
+    ax1.plot(subset_sizes, R_means, 'o-', lw=3, ms=14, color='#E74C3C', 
+             label='R.mean (observed)', zorder=5)
     
-    for l, val in zip(subset_sizes, R_means):
-        ax1.annotate(f'{val:.2e}', xy=(l, val), xytext=(0, 15),
+    # Error bars if multiple neurons
+    if n_neurons > 1 and any(s > 0 for s in R_stds):
+        ax1.errorbar(subset_sizes, R_means, yerr=R_stds, fmt='none', 
+                     color='#E74C3C', capsize=5, capthick=2, alpha=0.7)
+    
+    # Theoretical exponential fit line
+    l_fine = np.linspace(min(subset_sizes)-0.5, max(subset_sizes)+0.5, 100)
+    R_fit = np.exp(intercept + slope * l_fine)
+    ax1.plot(l_fine, R_fit, '--', lw=2, color='#7F8C8D', alpha=0.8,
+             label=f'Exponential fit: R ≈ {np.exp(intercept):.2f} × {g_bar_estimated:.2f}$^l$')
+    
+    # Annotate each point with value AND scaling factor
+    for i, (l, val) in enumerate(zip(subset_sizes, R_means)):
+        # Value annotation
+        ax1.annotate(f'{val:.2e}', xy=(l, val), xytext=(0, 20),
                     textcoords='offset points', ha='center', va='bottom',
-                    fontsize=10, fontweight='bold',
+                    fontsize=11, fontweight='bold',
                     bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
-                             edgecolor='gray', alpha=0.9))
+                             edgecolor='#E74C3C', alpha=0.95))
+        
+        # Scaling factor annotation (between points)
+        if i < len(scaling_factors):
+            mid_x = (subset_sizes[i] + subset_sizes[i+1]) / 2
+            mid_y = np.sqrt(R_means[i] * R_means[i+1])  # geometric mean for log scale
+            ax1.annotate(f'×{scaling_factors[i]:.2f}', xy=(mid_x, mid_y),
+                        fontsize=10, ha='center', va='center', color='#8E44AD',
+                        fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='#F5EEF8', 
+                                 edgecolor='#8E44AD', alpha=0.9))
     
-    ax1.set_xlabel('Set Size (l) - Number of Active Locations', fontsize=14, fontweight='bold')
-    ax1.set_ylabel('Pre-Normalized R.mean', fontsize=14, fontweight='bold')
-    
-    neuron_str = "1 neuron" if n_neurons == 1 else f"{n_neurons} neurons (avg)"
-    ax1.set_title(f'Pre-Normalized Response vs Set Size\n({neuron_str}, log scale)',
-                  fontsize=16, fontweight='bold', pad=20)
-    
+    ax1.set_xlabel('Set Size (l)', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Pre-Normalized R.mean (log scale)', fontsize=14, fontweight='bold')
+    ax1.set_title(f'Pre-Normalized Response vs Set Size\n({neuron_str})',
+                  fontsize=16, fontweight='bold')
     ax1.set_xticks(subset_sizes)
-    ax1.grid(True, alpha=0.3, linestyle='--', which='both')
+    ax1.legend(fontsize=11, loc='upper left')
+    ax1.grid(True, alpha=0.3, which='both')
+    
+    # ── Configuration & Statistics Box ──
+    config_text = (
+        f"Configuration\n"
+        f"─────────────────\n"
+        f"seed: {seed}\n"
+        f"n_orientations: {cfg['n_orientations']}\n"
+        f"n_locations: {cfg['total_locations']}\n"
+        f"λ_base: {cfg['base_lengthscale']}\n"
+        f"σ_λ: {cfg['lengthscale_variability']}"
+    )
+    ax1.text(0.98, 0.02, config_text, transform=ax1.transAxes,
+             fontsize=9, verticalalignment='bottom', horizontalalignment='right',
+             fontfamily='monospace',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='#FDEBD0', 
+                      edgecolor='#E67E22', alpha=0.95))
+    
+    # ── Scaling Summary Box ──
+    scaling_text = (
+        f"Scaling Summary\n"
+        f"─────────────────────\n"
+        f"Overall: ×{overall_scaling:.2f}\n"
+        f"(l={subset_sizes[0]}→{subset_sizes[-1]})\n"
+        f"─────────────────────\n"
+        f"Estimated ḡ: {g_bar_estimated:.3f}\n"
+        f"R² fit: {r_value**2:.4f}"
+    )
+    ax1.text(0.02, 0.98, scaling_text, transform=ax1.transAxes,
+             fontsize=10, verticalalignment='top', horizontalalignment='left',
+             fontfamily='monospace',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='#D5F5E3', 
+                      edgecolor='#27AE60', alpha=0.95))
+    
+    # ── Theory Box ──
+    theory_text = (
+        f"Theory: R = exp(Σ fₖ(θₖ)) ≈ ḡˡ\n"
+        f"More items → larger exponent\n"
+        f"→ Exponential explosion!"
+    )
+    ax1.text(0.98, 0.98, theory_text, transform=ax1.transAxes,
+             fontsize=10, verticalalignment='top', horizontalalignment='right',
+             style='italic',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='#FADBD8', 
+                      edgecolor='#E74C3C', alpha=0.95))
     
     plt.tight_layout()
-    
-    filepath = Path(save_dir) / f'exp1_pre_norm_{n_neurons}neurons_log.png'
+    filepath = Path(save_dir) / f'exp1_R_mean_{n_neurons}neurons.png'
     plt.savefig(filepath, dpi=300, bbox_inches='tight')
     print(f"  ✓ Saved: {filepath}")
+    figures['R_mean'] = fig1
     
-    figures['log_scale'] = fig1
+    # ────────────────────────────────────────────────────────────────────────
+    # PLOT 2: Per-Item Activity vs Set Size (ENHANCED)
+    # ────────────────────────────────────────────────────────────────────────
+    fig2, ax2 = plt.subplots(figsize=(12, 9))
+    ax2.set_yscale('log')
     
-    # ========================================
-    # PLOT 2: Linear Scale
-    # ========================================
-    fig2, ax2 = plt.subplots(figsize=(10, 7))
+    # Main data line
+    ax2.plot(subset_sizes, per_item_means, 's-', lw=3, ms=14, color='#27AE60', 
+             label='Per-Item Activity', zorder=5)
     
-    ax2.plot(subset_sizes, R_means, 'o-', linewidth=2.5, markersize=12,
-             color='#E74C3C', label='Pre-Normalized R.mean')
-    ax2.scatter(subset_sizes, R_means, s=200, c='#C0392B',
-                alpha=0.7, edgecolors='white', linewidths=2, zorder=5)
+    # Error bars if multiple neurons
+    if n_neurons > 1 and any(s > 0 for s in per_item_stds):
+        ax2.errorbar(subset_sizes, per_item_means, yerr=per_item_stds, fmt='none',
+                     color='#27AE60', capsize=5, capthick=2, alpha=0.7)
     
-    for l, val in zip(subset_sizes, R_means):
-        ax2.annotate(f'{val:.2e}', xy=(l, val), xytext=(0, 15),
+    # Per-item scaling factors
+    per_item_scaling = []
+    for i in range(len(subset_sizes) - 1):
+        fold = per_item_means[i+1] / (per_item_means[i] + 1e-10)
+        per_item_scaling.append(fold)
+    per_item_overall = per_item_means[-1] / (per_item_means[0] + 1e-10)
+    
+    # Annotate each point with value AND scaling factor
+    for i, (l, val) in enumerate(zip(subset_sizes, per_item_means)):
+        ax2.annotate(f'{val:.2e}', xy=(l, val), xytext=(0, 20),
                     textcoords='offset points', ha='center', va='bottom',
-                    fontsize=10, fontweight='bold',
+                    fontsize=11, fontweight='bold',
                     bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
-                             edgecolor='gray', alpha=0.9))
+                             edgecolor='#27AE60', alpha=0.95))
+        
+        # Scaling factor annotation
+        if i < len(per_item_scaling):
+            mid_x = (subset_sizes[i] + subset_sizes[i+1]) / 2
+            mid_y = np.sqrt(per_item_means[i] * per_item_means[i+1])
+            ax2.annotate(f'×{per_item_scaling[i]:.2f}', xy=(mid_x, mid_y),
+                        fontsize=10, ha='center', va='center', color='#8E44AD',
+                        fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='#F5EEF8', 
+                                 edgecolor='#8E44AD', alpha=0.9))
     
-    ax2.set_xlabel('Set Size (l) - Number of Active Locations', fontsize=14, fontweight='bold')
-    ax2.set_ylabel('Pre-Normalized R.mean', fontsize=14, fontweight='bold')
-    ax2.set_title(f'Pre-Normalized Response vs Set Size\n({neuron_str}, linear scale)',
-                  fontsize=16, fontweight='bold', pad=20)
-    
+    ax2.set_xlabel('Set Size (l)', fontsize=14, fontweight='bold')
+    ax2.set_ylabel('Per-Item Activity (log scale)', fontsize=14, fontweight='bold')
+    ax2.set_title(f'Per-Item Activity vs Set Size (Pre-DN)\n({neuron_str})',
+                  fontsize=16, fontweight='bold')
     ax2.set_xticks(subset_sizes)
-    ax2.grid(True, alpha=0.3, linestyle='--')
-    ax2.ticklabel_format(axis='y', style='scientific', scilimits=(0,0))
+    ax2.legend(fontsize=11, loc='upper left')
+    ax2.grid(True, alpha=0.3, which='both')
+    
+    # ── Configuration Box ──
+    ax2.text(0.98, 0.02, config_text, transform=ax2.transAxes,
+             fontsize=9, verticalalignment='bottom', horizontalalignment='right',
+             fontfamily='monospace',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='#FDEBD0', 
+                      edgecolor='#E67E22', alpha=0.95))
+    
+    # ── Scaling Summary Box ──
+    per_item_text = (
+        f"Per-Item Scaling\n"
+        f"─────────────────────\n"
+        f"Overall: ×{per_item_overall:.2f}\n"
+        f"(l={subset_sizes[0]}→{subset_sizes[-1]})\n"
+        f"─────────────────────\n"
+        f"Note: Per-item = R/l\n"
+        f"Still grows (pre-DN)!"
+    )
+    ax2.text(0.02, 0.98, per_item_text, transform=ax2.transAxes,
+             fontsize=10, verticalalignment='top', horizontalalignment='left',
+             fontfamily='monospace',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='#D5F5E3', 
+                      edgecolor='#27AE60', alpha=0.95))
+    
+    # ── Interpretation Box ──
+    interp_text = (
+        f"Pre-DN: Per-item activity\n"
+        f"GROWS with set size!\n"
+        f"(R grows faster than l)"
+    )
+    ax2.text(0.98, 0.98, interp_text, transform=ax2.transAxes,
+             fontsize=10, verticalalignment='top', horizontalalignment='right',
+             style='italic',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='#D6EAF8', 
+                      edgecolor='#2E86AB', alpha=0.95))
     
     plt.tight_layout()
-    
-    filepath = Path(save_dir) / f'exp1_pre_norm_{n_neurons}neurons_linear.png'
+    filepath = Path(save_dir) / f'exp1_per_item_{n_neurons}neurons.png'
     plt.savefig(filepath, dpi=300, bbox_inches='tight')
     print(f"  ✓ Saved: {filepath}")
+    figures['per_item'] = fig2
     
-    figures['linear_scale'] = fig2
-    
-    # ========================================
-    # PLOT 3: Distribution (population only)
-    # ========================================
+    # ────────────────────────────────────────────────────────────────────────
+    # PLOT 3: Separability Distribution (if multiple neurons)
+    # ────────────────────────────────────────────────────────────────────────
     if n_neurons > 1:
-        fig3, axes = plt.subplots(2, 2, figsize=(14, 10))
-        axes = axes.flatten()
+        fig3, ax3 = plt.subplots(figsize=(10, 6))
         
-        for idx, l in enumerate(subset_sizes):
-            ax = axes[idx]
-            all_values = population_summary[l]['all_values']
-            
-            sns.histplot(all_values, kde=True, ax=ax, color='#E74C3C',
-                        edgecolor='white', linewidth=1.5, alpha=0.7)
-            
-            mean_val = np.mean(all_values)
-            ax.axvline(mean_val, color='#C0392B', linestyle='--', linewidth=2,
-                      label=f'Mean: {mean_val:.2e}')
-            
-            ax.set_xlabel('R.mean per neuron', fontsize=12)
-            ax.set_ylabel('Count', fontsize=12)
-            n_subsets = len(list(combinations(range(8), l)))
-            ax.set_title(f'l = {l} (C(8,{l}) = {n_subsets} subsets)',
-                        fontsize=13, fontweight='bold')
-            ax.legend(loc='upper right', fontsize=10)
+        seps = separability['all_separabilities']
+        sns.histplot(seps, kde=True, ax=ax3, color='#9B59B6', alpha=0.7)
+        ax3.axvline(0.8, color='red', linestyle='--', lw=2, label='Mixed/Pure threshold')
+        ax3.axvline(np.mean(seps), color='#2E86AB', linestyle='-', lw=2,
+                   label=f'Mean: {np.mean(seps):.3f}')
         
-        fig3.suptitle(f'Distribution of Pre-Normalized R.mean\n({n_neurons} neurons)',
-                     fontsize=16, fontweight='bold', y=1.02)
+        ax3.set_xlabel('Separability Index', fontsize=14, fontweight='bold')
+        ax3.set_ylabel('Count', fontsize=14, fontweight='bold')
+        ax3.set_title(f'Separability Distribution\n({n_neurons} neurons, '
+                      f'{separability["classification"]["percent_mixed"]:.1f}% mixed)',
+                      fontsize=16, fontweight='bold')
+        ax3.legend(fontsize=11)
         
         plt.tight_layout()
-        
-        filepath = Path(save_dir) / f'exp1_pre_norm_{n_neurons}neurons_dist.png'
+        filepath = Path(save_dir) / f'exp1_separability_{n_neurons}neurons.png'
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
         print(f"  ✓ Saved: {filepath}")
-        
-        figures['distributions'] = fig3
+        figures['separability'] = fig3
     
     if show_plot:
         plt.show()
-    
-    print(f"\n  ✅ All plots saved to: {save_dir}/")
     
     return figures
 
@@ -466,20 +597,9 @@ if __name__ == '__main__':
     parser.add_argument('--seed', type=int, default=22)
     parser.add_argument('--save_dir', type=str, default='figures/exp1_pre_norm')
     parser.add_argument('--no_plot', action='store_true')
-    
     args = parser.parse_args()
     
-    results = run_experiment1(
-        n_neurons=args.n_neurons,
-        seed=args.seed,
-        verbose=True
-    )
+    results = run_experiment1(n_neurons=args.n_neurons, seed=args.seed)
     
     if not args.no_plot:
-        figures = plot_experiment1(results, save_dir=args.save_dir)
-    
-    # Save results
-    save_path = Path(args.save_dir) / f'exp1_results_{args.n_neurons}neurons.npy'
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(save_path, results, allow_pickle=True)
-    print(f"\n  💾 Results saved to: {save_path}")
+        plot_experiment1(results, save_dir=args.save_dir)

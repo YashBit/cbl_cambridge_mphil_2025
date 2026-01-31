@@ -1,365 +1,425 @@
-#!/usr/bin/env python
 """
-Unified Experiment Runner for Mixed Selectivity Analysis
+Master script to run all experiments with multiple seeds and neuron counts.
 
-This script runs:
-  --exp1  Pre-Normalized Response (exponential growth with set size)
-  --exp2  Post-Normalized Response with DN (parallel to exp1)
-  --exp3  Precision vs Set Size (behavioral prediction with Poisson spiking)
-  --both  Run exp1 and exp2 with same seed (for direct comparison)
+=============================================================================
+USAGE
+=============================================================================
 
-USAGE:
-    # Run pre-normalized (Experiment 1)
-    python run_experiments.py --exp1 --n_neurons 100
-    
-    # Run post-normalized with DN (Experiment 2)
-    python run_experiments.py --exp2 --n_neurons 100 --gamma 100
-    
-    # Run precision analysis (Experiment 3) - THE KEY BEHAVIORAL TEST
-    python run_experiments.py --exp3 --n_neurons 10 --n_trials 200
-    
-    # Run exp1 + exp2 for comparison
-    python run_experiments.py --both --n_neurons 100 --gamma 100
+Single experiment:
+    python scripts/run_experiments.py --exp 1
+    python scripts/run_experiments.py --exp 2 --n_neurons 50 --seed 22
 
-KEY INSIGHTS:
-    - Exp1 (Pre-DN): R.mean grows EXPONENTIALLY with set size
-    - Exp2 (Post-DN): R.mean scales same as Pre-DN (constant offset)
-    - Exp3 (Precision): PRECISION DECLINES with set size (behavioral prediction)
+Multiple seeds (for statistical robustness):
+    python scripts/run_experiments.py --exp 3 --seeds 42 43 44 45 46
 
-Author: Mixed Selectivity Project
-Date: December 2025
+Multiple neuron counts (scaling analysis):
+    python scripts/run_experiments.py --exp all --neurons 100 1000 10000
+
+Full batch run (all experiments, multiple seeds, multiple neuron counts):
+    python scripts/run_experiments.py --batch
+
+Custom batch:
+    python scripts/run_experiments.py --exp 3 4 --seeds 1 2 3 --neurons 100 10000
+
+=============================================================================
 """
 
-import sys
-import os
 import argparse
+import sys
+import time
+import json
 from pathlib import Path
+from datetime import datetime
+from itertools import product
 
 # Add parent directory to path
-script_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(script_dir)
-sys.path.insert(0, parent_dir)
-
-from experiments.exp1_pre_normalized import (
-    run_experiment1, plot_experiment1
-)
-from experiments.exp2_post_normalized import (
-    run_experiment2, plot_experiment2
-)
-from experiments.exp3_precision import (
-    run_experiment3, plot_experiment3
-)
-
-import numpy as np
-import matplotlib.pyplot as plt
+parent_dir = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(parent_dir))
 
 
-def parse_args():
-    """Parse command line arguments."""
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+DEFAULT_CONFIG = {
+    'n_orientations': 10,
+    'n_locations': 8,
+    'set_sizes': [2, 4, 6, 8],
+    'gamma': 100.0,
+    'sigma_sq': 1e-6,
+    'lambda_base': 0.3,
+    'sigma_lambda': 0.5,
+    'T_d': 0.1,
+    'n_trials': 500,
+    'kappa': 2.0,
+}
+
+BATCH_SEEDS = [42, 43, 44, 45, 46]
+BATCH_NEURONS = [100, 10000]
+
+
+# =============================================================================
+# EXPERIMENT RUNNERS
+# =============================================================================
+
+def run_single_experiment(
+    exp_num: int,
+    n_neurons: int,
+    seed: int,
+    config: dict,
+    output_base: str = 'results'
+) -> dict:
+    """
+    Run a single experiment with specified parameters.
+    
+    Returns
+    -------
+    result : dict
+        Contains status, timing, and output path
+    """
+    
+    # Create output directory with descriptive name including date
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"{output_base}/exp{exp_num}_seed{seed}_{timestamp}/N{n_neurons}"
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    start_time = time.time()
+    
+    try:
+        if exp_num == 1:
+            from experiments.exp1_pre_normalized import run_experiment_1, plot_results
+            
+            exp_config = {
+                'n_neurons': n_neurons,
+                'n_orientations': config['n_orientations'],
+                'n_locations': config['n_locations'],
+                'set_sizes': config['set_sizes'],
+                'seed': seed,
+                'lambda_base': config['lambda_base'],
+                'sigma_lambda': config['sigma_lambda'],
+            }
+            results = run_experiment_1(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+            
+        elif exp_num == 2:
+            from experiments.exp2_post_normalized import run_experiment_2, plot_results
+            
+            exp_config = {
+                'n_neurons': n_neurons,
+                'n_orientations': config['n_orientations'],
+                'n_locations': config['n_locations'],
+                'set_sizes': config['set_sizes'],
+                'seed': seed,
+                'gamma': config['gamma'],
+                'sigma_sq': config['sigma_sq'],
+                'lambda_base': config['lambda_base'],
+                'sigma_lambda': config['sigma_lambda'],
+            }
+            results = run_experiment_2(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+            
+        elif exp_num == 3:
+            from experiments.exp3_poisson_noise_snr import run_experiment_3, plot_results
+            
+            exp_config = {
+                'n_neurons': n_neurons,
+                'n_orientations': config['n_orientations'],
+                'n_locations': config['n_locations'],
+                'set_sizes': config['set_sizes'],
+                'seed': seed,
+                'gamma': config['gamma'],
+                'sigma_sq': config['sigma_sq'],
+                'lambda_base': config['lambda_base'],
+                'sigma_lambda': config['sigma_lambda'],
+                'T_d': config['T_d'],
+                'n_trials': config['n_trials'],
+            }
+            results = run_experiment_3(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+            
+        elif exp_num == 4:
+            from experiments.exp4_ml_decoding import run_experiment_4, plot_results
+            
+            exp_config = {
+                'n_neurons': n_neurons,
+                'n_orientations': 64,  # Finer resolution for decoding
+                'seed': seed,
+                'gamma': config['gamma'],
+                'T_d': config['T_d'],
+                'n_trials': config['n_trials'],
+                'kappa': config['kappa'],
+            }
+            results = run_experiment_4(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+            
+        else:
+            raise ValueError(f"Unknown experiment: {exp_num}")
+        
+        elapsed = time.time() - start_time
+        return {
+            'status': 'success',
+            'experiment': exp_num,
+            'n_neurons': n_neurons,
+            'seed': seed,
+            'elapsed_seconds': elapsed,
+            'output_dir': output_dir
+        }
+        
+    except Exception as e:
+        import traceback
+        elapsed = time.time() - start_time
+        return {
+            'status': 'error',
+            'experiment': exp_num,
+            'n_neurons': n_neurons,
+            'seed': seed,
+            'elapsed_seconds': elapsed,
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }
+
+
+def run_batch(
+    experiments: list,
+    neurons_list: list,
+    seeds_list: list,
+    config: dict,
+    output_base: str = 'results'
+) -> list:
+    """
+    Run multiple experiments across different seeds and neuron counts.
+    """
+    
+    total_runs = len(experiments) * len(neurons_list) * len(seeds_list)
+    
+    print("=" * 70)
+    print("BATCH EXPERIMENT RUN")
+    print("=" * 70)
+    print(f"\nConfiguration:")
+    print(f"  Experiments:   {experiments}")
+    print(f"  Neuron counts: {neurons_list}")
+    print(f"  Seeds:         {seeds_list}")
+    print(f"  Total runs:    {total_runs}")
+    print(f"  Output base:   {output_base}")
+    print()
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary_dir = Path(output_base) / f"batch_{timestamp}"
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    
+    results = []
+    run_count = 0
+    batch_start = time.time()
+    
+    for exp_num in experiments:
+        for n_neurons in neurons_list:
+            for seed in seeds_list:
+                run_count += 1
+                
+                print("\n" + "=" * 70)
+                print(f"RUN {run_count}/{total_runs}: Exp {exp_num}, N={n_neurons:,}, seed={seed}")
+                print("=" * 70)
+                
+                result = run_single_experiment(
+                    exp_num=exp_num,
+                    n_neurons=n_neurons,
+                    seed=seed,
+                    config=config,
+                    output_base=str(summary_dir)
+                )
+                
+                results.append(result)
+                
+                status_icon = "âœ“" if result['status'] == 'success' else "âœ—"
+                print(f"\n{status_icon} Completed in {result['elapsed_seconds']:.1f}s")
+    
+    batch_elapsed = time.time() - batch_start
+    
+    # Save summary
+    summary = {
+        'timestamp': timestamp,
+        'total_runs': total_runs,
+        'successful': sum(1 for r in results if r['status'] == 'success'),
+        'failed': sum(1 for r in results if r['status'] == 'error'),
+        'total_time_seconds': batch_elapsed,
+        'config': config,
+        'experiments': experiments,
+        'neurons_list': neurons_list,
+        'seeds_list': seeds_list,
+        'results': results
+    }
+    
+    summary_file = summary_dir / 'batch_summary.json'
+    with open(summary_file, 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    print("\n" + "=" * 70)
+    print("BATCH COMPLETE")
+    print("=" * 70)
+    print(f"\nðŸ“Š Summary:")
+    print(f"   Total runs:    {total_runs}")
+    print(f"   Successful:    {summary['successful']}")
+    print(f"   Failed:        {summary['failed']}")
+    print(f"   Total time:    {batch_elapsed/60:.1f} minutes")
+    print(f"\nðŸ“ Output: {summary_dir}")
+    print(f"ðŸ“„ Summary: {summary_file}")
+    
+    print(f"\nâ±ï¸  Timing by experiment:")
+    for exp_num in experiments:
+        exp_results = [r for r in results if r['experiment'] == exp_num and r['status'] == 'success']
+        if exp_results:
+            avg_time = sum(r['elapsed_seconds'] for r in exp_results) / len(exp_results)
+            print(f"   Exp {exp_num}: {avg_time:.1f}s average")
+    
+    errors = [r for r in results if r['status'] == 'error']
+    if errors:
+        print(f"\nâš ï¸  Errors ({len(errors)}):")
+        for e in errors:
+            print(f"   Exp {e['experiment']}, N={e['n_neurons']}, seed={e['seed']}: {e['error']}")
+    
+    return results
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
     parser = argparse.ArgumentParser(
         description='Run Mixed Selectivity Experiments',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Single neuron, pre-normalized only
-    python run_experiments.py --exp1 --n_neurons 1
-    
-    # Single neuron, post-normalized with DN
-    python run_experiments.py --exp2 --n_neurons 1 --gamma 100
-    
-    # Both experiments for comparison
-    python run_experiments.py --both --n_neurons 1
-    
-    # Population analysis (100 neurons)
-    python run_experiments.py --both --n_neurons 100 --gamma 100
-
-Key Insight:
-    Pre-DN (Exp1):  R.mean grows EXPONENTIALLY with set size
-    Post-DN (Exp2): R.mean is nearly FLAT (metabolic budget)
+  # Single experiment
+  python run_experiments.py --exp 2
+  
+  # With specific parameters
+  python run_experiments.py --exp 2 --n_neurons 50 --seed 22
+  
+  # Multiple experiments
+  python run_experiments.py --exp 2 3 4
+  
+  # Multiple seeds
+  python run_experiments.py --exp 2 --seeds 42 43 44
+  
+  # Multiple neuron counts
+  python run_experiments.py --exp 2 --neurons 100 10000
+  
+  # Full batch (default seeds and neurons)
+  python run_experiments.py --batch
+  
+  # Custom batch
+  python run_experiments.py --exp 2 3 --seeds 1 2 3 --neurons 100 1000
         """
     )
     
     # Experiment selection
-    exp_group = parser.add_mutually_exclusive_group(required=True)
-    exp_group.add_argument('--exp1', action='store_true',
-                          help='Run Experiment 1: Pre-Normalized Response')
-    exp_group.add_argument('--exp2', action='store_true',
-                          help='Run Experiment 2: Post-Normalized Response (DN)')
-    exp_group.add_argument('--exp3', action='store_true',
-                          help='Run Experiment 3: Precision vs Set Size (Poisson)')
-    exp_group.add_argument('--both', action='store_true',
-                          help='Run exp1 + exp2 for comparison')
+    parser.add_argument('--exp', type=int, nargs='+', default=None,
+                       help='Experiment number(s): 1, 2, 3, 4')
+    parser.add_argument('--all', action='store_true',
+                       help='Run all experiments')
+    parser.add_argument('--batch', action='store_true',
+                       help='Run full batch with default seeds [42-46] and neurons [100, 10000]')
     
-    # Common parameters
-    parser.add_argument('--n_neurons', type=int, default=1,
-                        help='Number of neurons (default: 1)')
-    parser.add_argument('--n_orientations', type=int, default=10,
-                        help='Number of orientation bins (default: 10)')
-    parser.add_argument('--theta_lengthscale', type=float, default=0.3,
-                        help='Base GP lengthscale (default: 0.3)')
-    parser.add_argument('--lengthscale_variability', type=float, default=0.5,
-                        help='Lengthscale variability σ_λ (default: 0.5)')
-    parser.add_argument('--seed', type=int, default=22,
-                        help='Random seed (default: 22)')
+    # Multi-run parameters
+    parser.add_argument('--seeds', type=int, nargs='+', default=[42],
+                       help='Random seed(s) to use')
+    parser.add_argument('--neurons', type=int, nargs='+', default=[100],
+                       help='Neuron count(s) to use')
     
-    # DN parameters (for exp2)
-    parser.add_argument('--gamma', type=float, default=100.0,
-                        help='DN gain constant in Hz (default: 100)')
-    parser.add_argument('--sigma_sq', type=float, default=1e-6,
-                        help='DN semi-saturation constant (default: 1e-6)')
+    # Single-run parameters (for backward compatibility)
+    parser.add_argument('--n_neurons', type=int, default=None,
+                       help='Number of neurons (single run)')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='Random seed (single run)')
     
-    # Exp3 parameters (Poisson spiking)
-    parser.add_argument('--n_trials', type=int, default=200,
-                        help='Trials per set size for exp3 (default: 200)')
-    parser.add_argument('--T_d', type=float, default=0.1,
-                        help='Decoding window in seconds (default: 0.1)')
+    # Experiment parameters
+    parser.add_argument('--n_orientations', type=int, default=10)
+    parser.add_argument('--n_locations', type=int, default=8)
+    parser.add_argument('--gamma', type=float, default=100.0)
+    parser.add_argument('--sigma_sq', type=float, default=1e-6)
+    parser.add_argument('--T_d', type=float, default=0.1)
+    parser.add_argument('--n_trials', type=int, default=500)
+    parser.add_argument('--kappa', type=float, default=2.0)
+    parser.add_argument('--output_dir', type=str, default='results')
     
-    # Output
-    parser.add_argument('--save_dir', type=str, default='figures',
-                        help='Base directory for saving figures (default: figures)')
-    parser.add_argument('--no_plot', action='store_true',
-                        help='Disable plotting')
+    args = parser.parse_args()
     
-    return parser.parse_args()
-
-
-def run_both_experiments(args):
-    """Run both experiments with same seed for direct comparison."""
+    # Build config
+    config = {
+        'n_orientations': args.n_orientations,
+        'n_locations': args.n_locations,
+        'set_sizes': [2, 4, 6, 8],
+        'gamma': args.gamma,
+        'sigma_sq': args.sigma_sq,
+        'lambda_base': 0.3,
+        'sigma_lambda': 0.5,
+        'T_d': args.T_d,
+        'n_trials': args.n_trials,
+        'kappa': args.kappa,
+    }
     
-    print("\n" + "🧠 "*20)
-    print("  MIXED SELECTIVITY EXPERIMENT SUITE")
-    print("🧠 "*20)
-    
-    print(f"\n  Running BOTH experiments with seed={args.seed}")
-    print(f"  This allows direct comparison of Pre-DN vs Post-DN")
-    
-    # Run Experiment 1
-    print("\n" + "─"*70)
-    results1 = run_experiment1(
-        n_neurons=args.n_neurons,
-        n_orientations=args.n_orientations,
-        theta_lengthscale=args.theta_lengthscale,
-        lengthscale_variability=args.lengthscale_variability,
-        seed=args.seed,
-        verbose=True
-    )
-    
-    # Run Experiment 2 with SAME seed
-    print("\n" + "─"*70)
-    results2 = run_experiment2(
-        n_neurons=args.n_neurons,
-        n_orientations=args.n_orientations,
-        theta_lengthscale=args.theta_lengthscale,
-        lengthscale_variability=args.lengthscale_variability,
-        gamma=args.gamma,
-        sigma_sq=args.sigma_sq,
-        seed=args.seed,  # SAME SEED for comparison
-        verbose=True
-    )
-    
-    # Create comparison summary
-    print("\n" + "="*70)
-    print("  COMPARISON SUMMARY")
-    print("="*70)
-    
-    subset_sizes = [2, 4, 6, 8]
-    
-    print(f"\n  {'l':<5} {'Pre-DN':<18} {'Post-DN':<18} {'Fold Reduction':<15}")
-    print("  " + "-"*60)
-    
-    for l in subset_sizes:
-        pre = results1['population_summary'][l]['R_mean']
-        post = results2['population_summary']['post_norm'][l]['R_mean']
-        fold = pre / (post + 1e-10)
-        print(f"  {l:<5} {pre:<18.4e} {post:<18.4e} {fold:<15.2f}×")
-    
-    # Key insight check
-    pre_values = [results1['population_summary'][l]['R_mean'] for l in subset_sizes]
-    post_values = [results2['population_summary']['post_norm'][l]['R_mean'] for l in subset_sizes]
-    
-    pre_fold_total = pre_values[-1] / pre_values[0]
-    post_fold_total = post_values[-1] / post_values[0]
-    
-    print(f"\n  KEY INSIGHT:")
-    print(f"    Pre-DN:  l=2→l=8 shows {pre_fold_total:.1f}× increase (EXPONENTIAL)")
-    print(f"    Post-DN: l=2→l=8 shows {post_fold_total:.1f}× increase (FLAT)")
-    
-    post_cv = np.std(post_values) / np.mean(post_values)
-    print(f"\n    Post-DN Coefficient of Variation: {post_cv:.2%}")
-    
-    if post_cv < 0.3:
-        print(f"    ✓ DN successfully CAPS total activity across set sizes")
+    # Determine experiments to run
+    if args.batch:
+        experiments = [1, 2, 3, 4]
+        seeds = BATCH_SEEDS
+        neurons = BATCH_NEURONS
+    elif args.all:
+        experiments = [1, 2, 3, 4]
+        seeds = args.seeds
+        neurons = args.neurons
+    elif args.exp:
+        experiments = args.exp
+        seeds = args.seeds
+        neurons = args.neurons
     else:
-        print(f"    ⚠ Post-DN shows more variation than expected")
+        print("Error: Specify --exp, --all, or --batch")
+        parser.print_help()
+        sys.exit(1)
     
-    # Plot if requested
-    if not args.no_plot:
-        save_dir1 = Path(args.save_dir) / 'exp1_pre_norm'
-        save_dir2 = Path(args.save_dir) / 'exp2_post_norm'
-        
-        plot_experiment1(results1, save_dir=str(save_dir1), show_plot=False)
-        plot_experiment2(results2, save_dir=str(save_dir2), show_plot=False)
-        
-        # Create combined comparison plot
-        create_comparison_plot(results1, results2, args)
-        
-        plt.show()
+    # Handle single-run backward compatibility
+    if args.n_neurons is not None:
+        neurons = [args.n_neurons]
+    if args.seed is not None:
+        seeds = [args.seed]
     
-    return results1, results2
-
-
-def create_comparison_plot(results1, results2, args):
-    """Create a combined comparison plot."""
-    import seaborn as sns
+    # Validate experiments
+    for e in experiments:
+        if e not in [1, 2, 3, 4]:
+            print(f"Error: Invalid experiment number: {e}")
+            sys.exit(1)
     
-    save_dir = Path(args.save_dir) / 'comparison'
-    save_dir.mkdir(parents=True, exist_ok=True)
+    # Run
+    print("=" * 70)
+    print("MIXED SELECTIVITY & DIVISIVE NORMALIZATION FRAMEWORK")
+    print("=" * 70)
     
-    subset_sizes = [2, 4, 6, 8]
-    
-    pre_means = [results1['population_summary'][l]['R_mean'] for l in subset_sizes]
-    post_means = [results2['population_summary']['post_norm'][l]['R_mean'] for l in subset_sizes]
-    
-    sns.set_style("whitegrid")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    
-    n_neurons = args.n_neurons
-    neuron_str = "1 neuron" if n_neurons == 1 else f"{n_neurons} neurons (avg)"
-    
-    # Left: Log scale comparison
-    ax1 = axes[0]
-    ax1.set_yscale('log')
-    ax1.plot(subset_sizes, pre_means, 'o-', linewidth=2.5, markersize=10,
-             color='#E74C3C', label='Pre-DN (raw)')
-    ax1.plot(subset_sizes, post_means, 's-', linewidth=2.5, markersize=10,
-             color='#2E86AB', label=f'Post-DN (γ={args.gamma})')
-    
-    ax1.set_xlabel('Set Size (l)', fontsize=14, fontweight='bold')
-    ax1.set_ylabel('R.mean (log scale)', fontsize=14, fontweight='bold')
-    ax1.set_title(f'Pre-DN vs Post-DN\n({neuron_str})', fontsize=16, fontweight='bold')
-    ax1.set_xticks(subset_sizes)
-    ax1.legend(fontsize=12)
-    ax1.grid(True, alpha=0.3, which='both')
-    
-    # Right: Post-DN only (linear) with horizontal line
-    ax2 = axes[1]
-    ax2.plot(subset_sizes, post_means, 's-', linewidth=2.5, markersize=12,
-             color='#2E86AB', label=f'Post-DN (γ={args.gamma})')
-    ax2.scatter(subset_sizes, post_means, s=200, c='#1A5276',
-                alpha=0.7, edgecolors='white', linewidths=2, zorder=5)
-    
-    mean_post = np.mean(post_means)
-    ax2.axhline(y=mean_post, color='#27AE60', linestyle='--', linewidth=2,
-                alpha=0.7, label=f'Mean: {mean_post:.2e}')
-    
-    for l, val in zip(subset_sizes, post_means):
-        ax2.annotate(f'{val:.2e}', xy=(l, val), xytext=(0, 12),
-                    textcoords='offset points', ha='center', va='bottom',
-                    fontsize=9, fontweight='bold',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
-                             edgecolor='gray', alpha=0.9))
-    
-    ax2.set_xlabel('Set Size (l)', fontsize=14, fontweight='bold')
-    ax2.set_ylabel('Post-DN R.mean', fontsize=14, fontweight='bold')
-    ax2.set_title(f'Post-DN Response (should be ~FLAT)\n({neuron_str})',
-                  fontsize=16, fontweight='bold')
-    ax2.set_xticks(subset_sizes)
-    ax2.legend(fontsize=11, loc='upper right')
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    filepath = save_dir / f'comparison_{n_neurons}neurons.png'
-    plt.savefig(filepath, dpi=300, bbox_inches='tight')
-    print(f"\n  ✓ Saved comparison plot: {filepath}")
-
-
-def main():
-    """Main entry point."""
-    args = parse_args()
-    
-    if args.both:
-        results1, results2 = run_both_experiments(args)
-        
-    elif args.exp1:
-        print("\n" + "🧠 "*20)
-        print("  EXPERIMENT 1: PRE-NORMALIZED RESPONSE")
-        print("🧠 "*20)
-        
-        results = run_experiment1(
-            n_neurons=args.n_neurons,
-            n_orientations=args.n_orientations,
-            theta_lengthscale=args.theta_lengthscale,
-            lengthscale_variability=args.lengthscale_variability,
-            seed=args.seed,
-            verbose=True
+    if len(experiments) == 1 and len(seeds) == 1 and len(neurons) == 1:
+        # Single run
+        result = run_single_experiment(
+            exp_num=experiments[0],
+            n_neurons=neurons[0],
+            seed=seeds[0],
+            config=config,
+            output_base=args.output_dir
         )
         
-        if not args.no_plot:
-            save_dir = Path(args.save_dir) / 'exp1_pre_norm'
-            plot_experiment1(results, save_dir=str(save_dir))
-        
-        # Save
-        save_path = Path(args.save_dir) / 'exp1_pre_norm' / f'exp1_results_{args.n_neurons}neurons.npy'
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(save_path, results, allow_pickle=True)
-        print(f"\n  💾 Results saved to: {save_path}")
-        
-    elif args.exp2:
-        print("\n" + "🧠 "*20)
-        print("  EXPERIMENT 2: POST-NORMALIZED RESPONSE (DN)")
-        print("🧠 "*20)
-        
-        results = run_experiment2(
-            n_neurons=args.n_neurons,
-            n_orientations=args.n_orientations,
-            theta_lengthscale=args.theta_lengthscale,
-            lengthscale_variability=args.lengthscale_variability,
-            gamma=args.gamma,
-            sigma_sq=args.sigma_sq,
-            seed=args.seed,
-            verbose=True
+        if result['status'] == 'success':
+            print(f"\nâœ“ Experiment {experiments[0]} complete ({result['elapsed_seconds']:.1f}s)")
+            print(f"  Output: {result['output_dir']}")
+        else:
+            print(f"\nâœ— Experiment {experiments[0]} failed: {result.get('error', 'Unknown error')}")
+            if 'traceback' in result:
+                print(result['traceback'])
+    else:
+        # Batch run
+        run_batch(
+            experiments=experiments,
+            neurons_list=neurons,
+            seeds_list=seeds,
+            config=config,
+            output_base=args.output_dir
         )
-        
-        if not args.no_plot:
-            save_dir = Path(args.save_dir) / 'exp2_post_norm'
-            plot_experiment2(results, save_dir=str(save_dir))
-        
-        # Save
-        save_path = Path(args.save_dir) / 'exp2_post_norm' / f'exp2_results_{args.n_neurons}neurons.npy'
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(save_path, results, allow_pickle=True)
-        print(f"\n  💾 Results saved to: {save_path}")
-    
-    elif args.exp3:
-        print("\n" + "🧠 "*20)
-        print("  EXPERIMENT 3: PRECISION VS SET SIZE (POISSON)")
-        print("🧠 "*20)
-        
-        results = run_experiment3(
-            n_neurons=args.n_neurons,
-            n_orientations=args.n_orientations,
-            n_trials_per_size=args.n_trials,
-            gamma=args.gamma,
-            sigma_sq=args.sigma_sq,
-            T_d=args.T_d,
-            seed=args.seed,
-            verbose=True
-        )
-        
-        if not args.no_plot:
-            save_dir = Path(args.save_dir) / 'exp3_precision'
-            plot_experiment3(results, save_dir=str(save_dir))
-        
-        # Save
-        save_path = Path(args.save_dir) / 'exp3_precision' / f'exp3_results_{args.n_neurons}neurons.npy'
-        save_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(save_path, results, allow_pickle=True)
-        print(f"\n  💾 Results saved to: {save_path}")
-    
-    print("\n" + "✅ "*20)
-    print("  EXPERIMENT COMPLETE")
-    print("✅ "*20)
 
 
 if __name__ == '__main__':
