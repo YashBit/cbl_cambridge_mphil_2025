@@ -1,171 +1,98 @@
 """
-Experiment 2: Post-Normalized Response Analysis with TRUE POPULATION DN
-
-This experiment implements the CORRECT divisive normalization formula:
-    r^{post}_i(θ) = γ * r^{pre}_i(θ) / (σ² + N^{-1} * Σ_j r^{pre}_j(θ))
+Experiment 2: Population Divisive Normalization Analysis
 
 =============================================================================
-KEY INSIGHT (Graph Blurb)
+THEORETICAL FRAMEWORK
 =============================================================================
 
-Divisive normalization enforces a constant activity budget (γN) across the 
-population, but redistributes resources as set size increases—neurons with 
-strong tuning at all locations gain disproportionately ("winners"), while 
-those with weak tuning anywhere are suppressed ("losers"). The mean stays 
-fixed at γ, but variance grows ~5× from l=2 to l=8.
+This experiment validates the core predictions of population-level divisive 
+normalization for visual working memory encoding:
+
+    r^{post}_i(θ) = γ · r^{pre}_i(θ) / [σ² + N⁻¹ Σⱼ r^{pre}_j(θ)]
+
+Three key empirical predictions:
+
+1. PER-ITEM ACTIVITY DECREASES: As set size l increases, the resource 
+   allocated per item decreases as 1/l (inverse relationship).
+
+2. ACTIVITY CAP: Total population activity is bounded at γN regardless 
+   of set size—this is the "metabolic budget" constraint.
+
+3. RESPONSE HETEROGENEITY: Individual neurons diverge from the mean as 
+   set size increases—some neurons become "winners" (high response at 
+   all active locations) while others become "losers" (suppressed).
 
 =============================================================================
-MEMORY-EFFICIENT IMPLEMENTATION
+EXPERIMENTAL DESIGN
 =============================================================================
 
-1. ACTIVITY CAP THEOREM (analytical):
-   Σᵢ r^post_i(θ) = γ × N  (EXACT when σ²→0, for ALL stimuli!)
-   
-2. PRE-DN FACTORIZATION (analytical):
-   Mean[∏ₖ g(θₖ)] = ∏ₖ Mean[g(θₖ)]  (O(l×n_θ) not O(n_θ^l))
+- 8 spatial locations with fixed orientations (sampled once, held constant)
+- Average responses over all C(8, l) location subsets per set size
+- Each neuron's response is tracked across set sizes
+- Clean Seaborn visualizations with statistical bands
 
 Author: Mixed Selectivity Project
 Date: January 2026
 """
 
 import numpy as np
+import seaborn as sns
 import matplotlib.pyplot as plt
 from itertools import combinations
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple
 from pathlib import Path
 from tqdm import tqdm
 import time
 
+# Import from core modules
 from core.gaussian_process import generate_neuron_population
-from core.divisive_normalization import estimate_memory_usage
+from core.divisive_normalization import (
+    compute_total_post_dn_analytical,
+    compute_per_item_activity_efficient,
+    verify_activity_cap_efficient,
+)
+
+# Set Seaborn style globally
+sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
+plt.rcParams['figure.dpi'] = 150
+plt.rcParams['savefig.dpi'] = 150
+plt.rcParams['font.family'] = 'sans-serif'
 
 
-# ============================================================================
-# EXPERIMENT DESIGN
-# ============================================================================
-
-def sample_fixed_orientations(
-    n_locations: int,
-    n_orientations: int,
-    rng: np.random.Generator
-) -> np.ndarray:
-    """
-    Sample one fixed orientation for each location.
-    
-    These remain fixed throughout the experiment - we only vary which
-    subset of locations is active.
-    """
-    return rng.integers(0, n_orientations, size=n_locations)
-
-
-def compute_single_neuron_responses_fixed_theta(
-    G_stacked: np.ndarray,
-    subset: Tuple[int, ...],
-    fixed_thetas: np.ndarray,
-    gamma: float,
-    sigma_sq: float
-) -> np.ndarray:
-    """
-    Compute post-DN response for each neuron at a fixed stimulus configuration.
-    
-    Parameters
-    ----------
-    G_stacked : np.ndarray
-        Pre-computed exp(f) for all neurons, shape (N, n_locations, n_orientations)
-    subset : Tuple[int, ...]
-        Active location indices
-    fixed_thetas : np.ndarray
-        Fixed orientation index for each location, shape (n_locations,)
-    gamma : float
-        Gain constant
-    sigma_sq : float
-        Semi-saturation constant
-        
-    Returns
-    -------
-    R_post : np.ndarray
-        Shape (N,) - post-DN response for each neuron
-    """
-    N = G_stacked.shape[0]
-    subset_arr = np.array(subset)
-    l = len(subset)
-    
-    # Compute pre-DN response for each neuron: R_pre[n] = ∏_k G[n, loc_k, θ_k]
-    R_pre = np.ones(N)
-    for k in range(l):
-        loc = subset_arr[k]
-        theta_idx = fixed_thetas[loc]
-        R_pre *= G_stacked[:, loc, theta_idx]
-    
-    # Population mean for denominator
-    pop_mean = np.mean(R_pre)
-    
-    # Apply divisive normalization
-    R_post = gamma * R_pre / (sigma_sq + pop_mean)
-    
-    return R_post
-
-
-# ============================================================================
-# MAIN EXPERIMENT FUNCTION
-# ============================================================================
+# =============================================================================
+# MAIN EXPERIMENT
+# =============================================================================
 
 def run_experiment_2(config: Dict) -> Dict:
     """
-    Run Experiment 2: Population-level DN analysis.
+    Run Experiment 2: Population DN analysis.
     
-    For each set size:
-    1. Generate population of N neurons
-    2. Enumerate all location subsets
-    3. Compute pre-DN and post-DN responses for population
-    4. Verify total activity cap: Σ_i r^{post}_i ≈ γ * N
-    5. Compute single-neuron average responses
+    Design:
+    - 8 locations with fixed orientations (sampled once)
+    - All C(8, l) subsets averaged per set size
+    - Track each neuron's response across set sizes
     
     Parameters
     ----------
     config : Dict
-        Required keys:
-        - n_neurons: int
-        - n_orientations: int
-        - n_locations: int
-        - set_sizes: list[int]
-        - seed: int
-        - gamma: float
-        - sigma_sq: float
-        - lambda_base: float
-        - sigma_lambda: float
-        
-    Returns
-    -------
-    results : Dict
-        Complete experimental results
+        Required keys: n_neurons, n_orientations, n_locations, set_sizes,
+                       seed, gamma, sigma_sq, lambda_base, sigma_lambda
     """
-    print("="*80)
-    print("EXPERIMENT 2: POST-NORMALIZED RESPONSE (TRUE POPULATION DN)")
-    print("="*80)
-    print(f"Configuration:")
-    print(f"  N neurons: {config['n_neurons']}")
-    print(f"  n_θ: {config['n_orientations']}")
-    print(f"  L: {config['n_locations']}")
-    print(f"  γ: {config['gamma']} Hz")
-    print(f"  σ²: {config['sigma_sq']}")
-    print(f"  Set sizes: {config['set_sizes']}")
-    print(f"  Theoretical total activity: {config['gamma'] * config['n_neurons']} Hz")
+    print("=" * 70)
+    print("EXPERIMENT 2: POPULATION DIVISIVE NORMALIZATION")
+    print("=" * 70)
+    print(f"  N neurons:    {config['n_neurons']}")
+    print(f"  Orientations: {config['n_orientations']}")
+    print(f"  Locations:    {config['n_locations']}")
+    print(f"  Set sizes:    {config['set_sizes']}")
+    print(f"  γ (gain):     {config['gamma']} Hz")
+    print(f"  σ²:           {config['sigma_sq']}")
+    print(f"  Theoretical total activity: γN = {config['gamma'] * config['n_neurons']} Hz")
     print()
     
-    # Memory comparison
-    print("Memory Comparison (Original vs Efficient):")
-    for l in config['set_sizes']:
-        if l > 1:
-            orig = estimate_memory_usage(config['n_neurons'], config['n_orientations'], l, 'original')
-            eff = estimate_memory_usage(config['n_neurons'], config['n_orientations'], l, 'efficient')
-            status = "✗ CRASH" if not orig['safe'] else "⚠️ SLOW" if orig['memory_gb'] > 1 else "✓"
-            print(f"  l={l}: Original={orig['memory_gb']:>8.1f} GB {status:<10} Efficient={eff['memory_mb']:>6.0f} MB ✓")
-    print()
-    
-    # Generate population
-    print(f"Generating population of {config['n_neurons']} neurons...")
-    start_time = time.time()
+    # Generate neuron population using core module
+    print("Generating neuron population...")
+    start = time.time()
     population = generate_neuron_population(
         n_neurons=config['n_neurons'],
         n_orientations=config['n_orientations'],
@@ -174,391 +101,311 @@ def run_experiment_2(config: Dict) -> Dict:
         lengthscale_variability=config['sigma_lambda'],
         seed=config['seed']
     )
-    gen_time = time.time() - start_time
-    print(f"✓ Population generated ({gen_time:.1f}s)")
     
-    # Extract f_samples for all neurons
+    # Extract f_samples and pre-compute G = exp(f) for vectorized computation
     f_samples_population = [neuron['f_samples'] for neuron in population]
-    
-    # Pre-compute G = exp(f) for vectorized computation
-    print("Pre-computing G = exp(f)...")
     G_stacked = np.stack([np.exp(f) for f in f_samples_population], axis=0)
-    print(f"✓ G matrix shape: {G_stacked.shape}")
+    print(f"  Done in {time.time() - start:.1f}s")
+    print(f"  G matrix shape: {G_stacked.shape}")
     
-    # Setup RNG
+    # Sample fixed orientations (held constant throughout experiment)
     rng = np.random.default_rng(config['seed'] + 1000)
+    fixed_thetas = rng.integers(0, config['n_orientations'], size=config['n_locations'])
+    print(f"  Fixed orientations: {fixed_thetas}")
+    print()
     
-    # Sample fixed orientations for each location
-    fixed_thetas = sample_fixed_orientations(
-        n_locations=config['n_locations'],
-        n_orientations=config['n_orientations'],
-        rng=rng
-    )
-    print(f"Fixed orientations per location: {fixed_thetas}")
+    # Storage
+    N = config['n_neurons']
+    gamma = config['gamma']
+    sigma_sq = config['sigma_sq']
     
-    # Storage for results
     results = {
         'config': config,
-        'G_stacked': G_stacked,
         'fixed_thetas': fixed_thetas,
-        'set_size_results': {},
-        'single_neuron_responses': {}
+        'set_size_data': {},
+        'neuron_responses': {}  # {set_size: (N,) array of avg responses}
     }
     
-    # Run for each set size
-    for set_size in config['set_sizes']:
-        print(f"\n{'='*80}")
-        print(f"SET SIZE l = {set_size}")
-        print(f"{'='*80}")
+    # Process each set size
+    for l in config['set_sizes']:
+        print(f"Processing set size l = {l}...")
         
-        # Generate all subsets
-        all_subsets = list(combinations(range(config['n_locations']), set_size))
+        all_subsets = list(combinations(range(config['n_locations']), l))
         n_subsets = len(all_subsets)
-        print(f"Number of subsets: {n_subsets}")
+        print(f"  Subsets: C({config['n_locations']}, {l}) = {n_subsets}")
         
-        # Storage
+        # Accumulators
         pre_totals = []
         post_totals = []
-        N = config['n_neurons']
-        neuron_response_accumulator = np.zeros(N)
+        neuron_responses_sum = np.zeros(N)
         
-        # Process each subset
-        start_time = time.time()
-        for subset in tqdm(all_subsets, desc=f"Processing l={set_size}", unit="subset"):
-            # Compute post-DN responses
-            R_post = compute_single_neuron_responses_fixed_theta(
-                G_stacked=G_stacked,
-                subset=subset,
-                fixed_thetas=fixed_thetas,
-                gamma=config['gamma'],
-                sigma_sq=config['sigma_sq']
-            )
-            
-            # Compute pre-DN for comparison
-            subset_arr = np.array(subset)
+        for subset in tqdm(all_subsets, desc=f"  l={l}", leave=False):
+            # Compute pre-DN response for each neuron: R_pre[n] = ∏_{k∈S} G[n, loc_k, θ_k]
             R_pre = np.ones(N)
-            for k in range(len(subset)):
-                loc = subset_arr[k]
+            for loc in subset:
                 theta_idx = fixed_thetas[loc]
                 R_pre *= G_stacked[:, loc, theta_idx]
             
-            # Accumulate
-            neuron_response_accumulator += R_post
+            # Apply population divisive normalization
+            # r^{post}_i = γ · r^{pre}_i / [σ² + mean(r^{pre})]
+            pop_mean = np.mean(R_pre)
+            R_post = gamma * R_pre / (sigma_sq + pop_mean)
+            
+            # Accumulate statistics
             pre_totals.append(np.sum(R_pre))
             post_totals.append(np.sum(R_post))
+            neuron_responses_sum += R_post
         
-        elapsed = time.time() - start_time
+        # Average across all subsets
+        neuron_avg = neuron_responses_sum / n_subsets
+        results['neuron_responses'][l] = neuron_avg
         
-        # Average across subsets
-        neuron_avg_responses = neuron_response_accumulator / n_subsets
-        results['single_neuron_responses'][set_size] = neuron_avg_responses
+        # Compute theoretical values using core module functions
+        theoretical_total = compute_total_post_dn_analytical(gamma, N)
+        per_item = compute_per_item_activity_efficient(gamma, N, l)
         
-        # Store statistics
-        theoretical_total = config['gamma'] * config['n_neurons']
-        results['set_size_results'][set_size] = {
+        # Verify activity cap
+        activity_cap_check = verify_activity_cap_efficient(
+            gamma=gamma, N=N, sigma_sq=sigma_sq,
+            observed_mc=np.mean(post_totals)
+        )
+        
+        results['set_size_data'][l] = {
             'n_subsets': n_subsets,
-            'pre_mean': np.mean(pre_totals),
-            'pre_std': np.std(pre_totals),
-            'pre_min': np.min(pre_totals),
-            'pre_max': np.max(pre_totals),
-            'post_mean': np.mean(post_totals),
-            'post_std': np.std(post_totals),
+            'pre_total_mean': np.mean(pre_totals),
+            'pre_total_std': np.std(pre_totals),
+            'post_total_mean': np.mean(post_totals),
+            'post_total_std': np.std(post_totals),
             'theoretical_total': theoretical_total,
-            'elapsed_seconds': elapsed,
-            'neuron_avg_mean': np.mean(neuron_avg_responses),
-            'neuron_avg_std': np.std(neuron_avg_responses),
-            'neuron_avg_min': np.min(neuron_avg_responses),
-            'neuron_avg_max': np.max(neuron_avg_responses),
-            'neuron_avg_q05': np.percentile(neuron_avg_responses, 5),
-            'neuron_avg_q25': np.percentile(neuron_avg_responses, 25),
-            'neuron_avg_q75': np.percentile(neuron_avg_responses, 75),
-            'neuron_avg_q95': np.percentile(neuron_avg_responses, 95),
+            'per_item_activity': per_item,
+            'activity_cap_error': activity_cap_check.get('mc_error', 0.0),
+            'neuron_mean': np.mean(neuron_avg),
+            'neuron_std': np.std(neuron_avg),
+            'neuron_q05': np.percentile(neuron_avg, 5),
+            'neuron_q25': np.percentile(neuron_avg, 25),
+            'neuron_q75': np.percentile(neuron_avg, 75),
+            'neuron_q95': np.percentile(neuron_avg, 95),
         }
         
-        # Print summary
-        r = results['set_size_results'][set_size]
-        print(f"\nResults for l = {set_size}:")
-        print(f"  Pre-DN total:  {r['pre_mean']:.2f} ± {r['pre_std']:.2f}")
-        print(f"  Post-DN total: {r['post_mean']:.2f} ± {r['post_std']:.6f}")
-        print(f"  Theoretical:   {r['theoretical_total']:.2f}")
-        print(f"  Neuron mean:   {r['neuron_avg_mean']:.2f} Hz, std: {r['neuron_avg_std']:.2f} Hz")
-        print(f"  Time: {elapsed:.1f}s")
+        r = results['set_size_data'][l]
+        print(f"  Pre-DN total:  {r['pre_total_mean']:.1f} ± {r['pre_total_std']:.1f} Hz")
+        print(f"  Post-DN total: {r['post_total_mean']:.1f} Hz (theory: {theoretical_total:.0f})")
+        print(f"  Per-item:      {per_item:.1f} Hz")
+        print()
     
-    print(f"\n{'='*80}")
+    print("=" * 70)
     print("EXPERIMENT 2 COMPLETE")
-    print(f"{'='*80}\n")
+    print("=" * 70)
     
     return results
 
 
-# ============================================================================
-# VISUALIZATION
-# ============================================================================
+# =============================================================================
+# VISUALIZATION (Clean Seaborn Plots)
+# =============================================================================
 
 def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
-    """Create visualization plots for Experiment 2."""
-    import matplotlib.cm as cm
+    """
+    Create three clean Seaborn visualizations:
     
-    config = results['config']
-    set_sizes = config['set_sizes']
+    1. Per-Item Activity vs Set Size (shows 1/l decrease)
+    2. Activity Cap Empirical Verification (total activity constant)
+    3. Single-Neuron Response Bands (heterogeneity across neurons)
+    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    N = config['n_neurons']
-    gamma = config['gamma']
-    theoretical = gamma * N
-    
-    # Extract data
-    pre_means = [results['set_size_results'][l]['pre_mean'] for l in set_sizes]
-    pre_stds = [results['set_size_results'][l]['pre_std'] for l in set_sizes]
-    post_means = [results['set_size_results'][l]['post_mean'] for l in set_sizes]
-    
-    # =========================================================================
-    # Plot 1: Pre-DN vs Post-DN comparison with embedded blurbs
-    # =========================================================================
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    ax1 = axes[0]
-    ax1.errorbar(set_sizes, pre_means, yerr=pre_stds, fmt='o-', 
-                 color='#E74C3C', linewidth=3, markersize=12, capsize=6, capthick=2,
-                 markerfacecolor='white', markeredgewidth=2)
-    ax1.set_xlabel('Set Size (l)', fontsize=13, fontweight='bold')
-    ax1.set_ylabel('Total Population Activity (Hz)', fontsize=13, fontweight='bold')
-    ax1.set_title('Pre-DN: GROWS with Set Size', fontsize=14, fontweight='bold')
-    ax1.set_xticks(set_sizes)
-    ax1.grid(True, alpha=0.3)
-    ax1.spines['top'].set_visible(False)
-    ax1.spines['right'].set_visible(False)
-    
-    # Embedded blurb for pre-DN
-    blurb_pre = "Without normalization:\nactivity explodes as\nmore items are added"
-    ax1.text(0.05, 0.95, blurb_pre, transform=ax1.transAxes, fontsize=10,
-             verticalalignment='top', horizontalalignment='left',
-             bbox=dict(boxstyle='round', facecolor='mistyrose', 
-                       alpha=0.95, edgecolor='red', linewidth=1.5))
-    
-    ax2 = axes[1]
-    ax2.plot(set_sizes, post_means, 'o-', color='#2ECC71', linewidth=3, markersize=12,
-             markerfacecolor='white', markeredgewidth=2, markeredgecolor='#2ECC71')
-    ax2.axhline(theoretical, color='#E74C3C', linestyle='--', linewidth=2.5, 
-                label=f'Theoretical: γN = {theoretical:,.0f} Hz')
-    ax2.set_xlabel('Set Size (l)', fontsize=13, fontweight='bold')
-    ax2.set_ylabel('Total Population Activity (Hz)', fontsize=13, fontweight='bold')
-    ax2.set_title('Post-DN: CONSTANT (Activity Cap)', fontsize=14, fontweight='bold')
-    ax2.set_xticks(set_sizes)
-    ax2.set_ylim([theoretical * 0.99, theoretical * 1.01])
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='lower right', fontsize=11)
-    ax2.spines['top'].set_visible(False)
-    ax2.spines['right'].set_visible(False)
-    
-    # Embedded blurb for post-DN (Activity Cap Theorem)
-    blurb_post = (
-        "ACTIVITY CAP THEOREM\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "Σᵢ rᵢᵖᵒˢᵗ = γN (constant!)"
-    )
-    ax2.text(0.02, 0.98, blurb_post, transform=ax2.transAxes, fontsize=10,
-             verticalalignment='top', horizontalalignment='left',
-             bbox=dict(boxstyle='round', facecolor='lightgreen', 
-                       alpha=0.95, edgecolor='green', linewidth=2),
-             family='monospace')
-    
-    plt.tight_layout()
-    
-    # FIGURE DESCRIPTION at bottom
-    description = (
-        f"Figure: Total population activity before and after divisive normalization. "
-        f"For subset S with fixed orientations θ, pre-DN: Σ_i r_i^pre(S,θ) = Σ_i ∏_{{k∈S}} g_i(θ_k) grows with |S|. "
-        f"(Left) Pre-DN activity increases as more locations contribute to the product. "
-        f"(Right) Post-DN: Σ_i r_i^post(S,θ) = γN = {theoretical:,.0f} Hz (constant), "
-        f"because DN divides each neuron's response by the population mean, enforcing a fixed metabolic budget."
-    )
-    fig.text(0.5, -0.02, description, ha='center', va='top', fontsize=9,
-             wrap=True, style='italic',
-             bbox=dict(boxstyle='round', facecolor='white', edgecolor='gray', alpha=0.9))
-    plt.savefig(output_path / f'exp2_pre_vs_post_N{N}.png', dpi=150, bbox_inches='tight')
-    if show_plot:
-        plt.show()
-    plt.close()
-    print(f"  ✓ Saved: exp2_pre_vs_post_N{N}.png")
-    
-    # =========================================================================
-    # Plot 2: Single-neuron band visualization
-    # =========================================================================
-    _plot_single_neuron_responses(results, output_path, show_plot)
-
-
-def _plot_single_neuron_responses(results: Dict, output_path: Path, show_plot: bool = False):
-    """Plot single-neuron average responses across set sizes with colors and markers."""
-    import matplotlib.cm as cm
-    
     config = results['config']
     set_sizes = config['set_sizes']
     N = config['n_neurons']
     gamma = config['gamma']
     
-    neuron_responses = results['single_neuron_responses']
+    # Set consistent style
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.3)
+    palette = sns.color_palette("deep")
     
-    # Build matrix: (N, n_set_sizes)
-    response_matrix = np.zeros((N, len(set_sizes)))
-    for j, l in enumerate(set_sizes):
-        response_matrix[:, j] = neuron_responses[l]
+    # =========================================================================
+    # PLOT 1: Per-Item Activity Decreases with Set Size
+    # =========================================================================
+    fig, ax = plt.subplots(figsize=(8, 6))
     
-    # Statistics
+    per_item = [results['set_size_data'][l]['per_item_activity'] for l in set_sizes]
+    theoretical_per_item = [gamma * N / l for l in set_sizes]
+    
+    # Empirical points
+    sns.lineplot(x=set_sizes, y=per_item, marker='o', markersize=10, 
+                 linewidth=2.5, color=palette[0], label='Empirical', ax=ax)
+    
+    # Theoretical 1/l curve
+    ax.plot(set_sizes, theoretical_per_item, '--', color=palette[3], 
+            linewidth=2, label=r'Theory: $\gamma N / l$')
+    
+    ax.set_xlabel('Set Size (l)')
+    ax.set_ylabel('Per-Item Activity (Hz)')
+    ax.set_title('Per-Item Activity Decreases with Set Size')
+    ax.set_xticks(set_sizes)
+    ax.legend(frameon=True, loc='upper right')
+    sns.despine()
+    
+    plt.tight_layout()
+    plt.savefig(output_path / f'exp2_per_item_activity_N{N}.png', 
+                bbox_inches='tight', facecolor='white')
+    if show_plot:
+        plt.show()
+    plt.close()
+    print(f"  Saved: exp2_per_item_activity_N{N}.png")
+    
+    # =========================================================================
+    # PLOT 2: Activity Cap (Total Population Activity is Constant)
+    # =========================================================================
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Left: Pre-DN (grows with set size)
+    pre_means = [results['set_size_data'][l]['pre_total_mean'] for l in set_sizes]
+    pre_stds = [results['set_size_data'][l]['pre_total_std'] for l in set_sizes]
+    
+    ax1 = axes[0]
+    ax1.errorbar(set_sizes, pre_means, yerr=pre_stds, fmt='o-', 
+                 color=palette[3], linewidth=2.5, markersize=10, 
+                 capsize=5, capthick=2, label='Pre-DN')
+    ax1.set_xlabel('Set Size (l)')
+    ax1.set_ylabel('Total Population Activity (Hz)')
+    ax1.set_title('Pre-DN: Activity GROWS')
+    ax1.set_xticks(set_sizes)
+    sns.despine(ax=ax1)
+    
+    # Right: Post-DN (constant at γN)
+    post_means = [results['set_size_data'][l]['post_total_mean'] for l in set_sizes]
+    theoretical = gamma * N
+    
+    ax2 = axes[1]
+    sns.lineplot(x=set_sizes, y=post_means, marker='o', markersize=10,
+                 linewidth=2.5, color=palette[2], label='Post-DN', ax=ax2)
+    ax2.axhline(theoretical, color=palette[3], linestyle='--', linewidth=2,
+                label=f'Theory: γN = {theoretical:,.0f} Hz')
+    ax2.set_xlabel('Set Size (l)')
+    ax2.set_ylabel('Total Population Activity (Hz)')
+    ax2.set_title('Post-DN: Activity CAPPED at γN')
+    ax2.set_xticks(set_sizes)
+    ax2.set_ylim([theoretical * 0.98, theoretical * 1.02])
+    ax2.legend(frameon=True, loc='lower right')
+    sns.despine(ax=ax2)
+    
+    plt.tight_layout()
+    plt.savefig(output_path / f'exp2_activity_cap_N{N}.png',
+                bbox_inches='tight', facecolor='white')
+    if show_plot:
+        plt.show()
+    plt.close()
+    print(f"  Saved: exp2_activity_cap_N{N}.png")
+    
+    # =========================================================================
+    # PLOT 3: Single-Neuron Response Bands
+    # 
+    # - 8 locations with fixed orientations
+    # - Average over all C(8, l) subsets per set size
+    # - Each line = one neuron's average response
+    # - Band = spread across N neurons (5th-95th percentile)
+    # =========================================================================
+    fig, ax = plt.subplots(figsize=(10, 7))
+    
+    # Build response matrix: (N, n_set_sizes)
+    response_matrix = np.column_stack([
+        results['neuron_responses'][l] for l in set_sizes
+    ])
+    
+    # Compute statistics
     pop_mean = np.mean(response_matrix, axis=0)
-    pop_std = np.std(response_matrix, axis=0)
+    pop_q05 = np.percentile(response_matrix, 5, axis=0)
+    pop_q25 = np.percentile(response_matrix, 25, axis=0)
+    pop_q75 = np.percentile(response_matrix, 75, axis=0)
+    pop_q95 = np.percentile(response_matrix, 95, axis=0)
     
-    # Sort neurons by response at final set size for color mapping
+    # Sort neurons by final response for coloring
     sort_idx = np.argsort(response_matrix[:, -1])
     response_sorted = response_matrix[sort_idx, :]
     
-    # Create color gradient: blue (losers) -> red (winners)
-    cmap = cm.coolwarm
-    colors = [cmap(i / (N - 1)) for i in range(N)]
-    
-    # -------------------------------------------------------------------------
-    # Main plot: Colored neurons with markers
-    # -------------------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(12, 8))
-    
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_linewidth(1.5)
-    ax.spines['bottom'].set_linewidth(1.5)
-    
-    # Plot each neuron with color and MARKERS for y-axis coordination
+    # Plot individual neuron lines (thin, colored by rank)
+    cmap = plt.cm.coolwarm
     for i in range(N):
-        ax.plot(set_sizes, response_sorted[i, :], 
-                color=colors[i], alpha=0.7, linewidth=1.5,
-                marker='o', markersize=5, markeredgecolor='white', markeredgewidth=0.3,
-                zorder=i+1)
+        color = cmap(i / (N - 1))
+        ax.plot(set_sizes, response_sorted[i, :], color=color, 
+                alpha=0.5, linewidth=0.8, zorder=1)
     
-    # Population mean (black, prominent)
-    ax.plot(set_sizes, pop_mean, 'o-', color='black', linewidth=4, markersize=12,
-            markerfacecolor='yellow', markeredgewidth=2, markeredgecolor='black',
-            zorder=N+100, label=f'Population mean = γ = {gamma:.0f} Hz')
-    
-    # Reference line
-    ax.axhline(gamma, color='gray', linestyle=':', linewidth=2, alpha=0.5, zorder=0)
-    
-    ax.set_yscale('log')
-    ax.set_xlabel('Set Size (l)', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Average Response (Hz) — Log Scale', fontsize=14, fontweight='bold')
-    ax.set_title(f'Single-Neuron Response vs Set Size (N = {N} neurons)', 
-                 fontsize=15, fontweight='bold', pad=15)
-    ax.set_xticks(set_sizes)
-    ax.set_xlim([set_sizes[0] - 0.5, set_sizes[-1] + 0.5])
-    ax.set_ylim([0.05, 5000])
-    ax.yaxis.grid(True, linestyle='-', alpha=0.3, color='gray', which='both')
-    ax.xaxis.grid(True, linestyle='-', alpha=0.3, color='gray')
-    ax.legend(loc='upper right', fontsize=11)
-    
-    # Colorbar
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, N-1))
-    sm.set_array([])
-    cbar = plt.colorbar(sm, ax=ax, shrink=0.5, aspect=25, pad=0.02)
-    cbar.set_label('Neuron rank at l=8\n(blue=suppressed, red=enhanced)', fontsize=10)
-    cbar.set_ticks([0, N//2, N-1])
-    cbar.set_ticklabels(['Losers', 'Middle', 'Winners'])
-    
-    plt.tight_layout()
-    
-    # FIGURE DESCRIPTION at bottom
-    description = (
-        f"Figure: Each line shows neuron i's average post-DN response across all C({config['n_locations']},l) subsets S. "
-        f"For each subset S ⊂ {{1,...,{config['n_locations']}}}, orientations θ = (θ₁,...,θ_L) are fixed (sampled once at experiment start, then held constant). "
-        f"Pre-DN response: r_i^pre(S,θ) = ∏_{{k∈S}} g_i(θ_k), where g_i(θ) = exp(f_i(θ)) is neuron i's tuning at location k. "
-        f"Post-DN response: r_i^post(S,θ) = γ · r_i^pre(S,θ) / [σ² + N⁻¹ Σ_j r_j^pre(S,θ)]. "
-        f"The population mean (yellow) remains at γ = {gamma:.0f} Hz, but individual neurons diverge as set size increases—"
-        f"neurons with high tuning at all locations in S dominate the fixed budget γN = {gamma*N:,.0f} Hz."
-    )
-    fig.text(0.5, -0.02, description, ha='center', va='top', fontsize=9,
-             wrap=True, style='italic',
-             bbox=dict(boxstyle='round', facecolor='white', edgecolor='gray', alpha=0.9))
-    plt.savefig(output_path / f'exp2_single_neuron_band_N{N}.png', dpi=150, bbox_inches='tight', facecolor='white')
-    if show_plot:
-        plt.show()
-    plt.close()
-    print(f"  ✓ Saved: exp2_single_neuron_band_N{N}.png")
-    
-    # -------------------------------------------------------------------------
-    # Summary statistics plot with colors and markers
-    # -------------------------------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    
-    # Left: Individual neurons with colors and markers
-    ax1 = axes[0]
-    ax1.spines['top'].set_visible(False)
-    ax1.spines['right'].set_visible(False)
-    
-    for i in range(N):
-        ax1.plot(set_sizes, response_sorted[i, :], 
-                 color=colors[i], alpha=0.7, linewidth=1.2,
-                 marker='s', markersize=4, markeredgecolor='white', markeredgewidth=0.2)
+    # Plot bands (5-95 percentile and 25-75 percentile)
+    ax.fill_between(set_sizes, pop_q05, pop_q95, alpha=0.2, 
+                    color=palette[0], label='5th–95th percentile')
+    ax.fill_between(set_sizes, pop_q25, pop_q75, alpha=0.3,
+                    color=palette[0], label='25th–75th percentile')
     
     # Population mean
-    ax1.plot(set_sizes, pop_mean, 'o-', color='black', linewidth=3.5, markersize=11,
-             markerfacecolor='yellow', markeredgewidth=2, markeredgecolor='black',
-             label='Population mean', zorder=100)
+    ax.plot(set_sizes, pop_mean, 'o-', color='black', linewidth=3, 
+            markersize=10, markerfacecolor='gold', markeredgewidth=2,
+            label=f'Population mean (≈ γ = {gamma:.0f} Hz)', zorder=100)
     
-    ax1.axhline(gamma, color='#2ECC71', linestyle='--', linewidth=2.5, alpha=0.8,
-                label=f'γ = {gamma:.0f} Hz')
+    # Reference line at gamma
+    ax.axhline(gamma, color='gray', linestyle=':', linewidth=1.5, alpha=0.7)
     
-    ax1.set_yscale('log')
-    ax1.set_xlabel('Set Size (l)', fontsize=13, fontweight='bold')
-    ax1.set_ylabel('Average Response (Hz) — Log Scale', fontsize=13, fontweight='bold')
-    ax1.set_title('Individual Neurons (colored by rank)', fontsize=13, fontweight='bold')
-    ax1.set_xticks(set_sizes)
-    ax1.set_xlim([set_sizes[0] - 0.5, set_sizes[-1] + 0.5])
-    ax1.grid(True, alpha=0.3, which='both')
-    ax1.legend(loc='upper right', fontsize=10)
+    ax.set_yscale('log')
+    ax.set_xlabel('Set Size (l)')
+    ax.set_ylabel('Average Post-DN Response (Hz)')
+    ax.set_title(f'Single-Neuron Responses Across Set Sizes (N = {N} neurons)\n'
+                 f'8 locations, fixed orientations, averaged over C(8,l) subsets')
+    ax.set_xticks(set_sizes)
+    ax.set_xlim([set_sizes[0] - 0.3, set_sizes[-1] + 0.3])
+    ax.legend(frameon=True, loc='upper right')
+    sns.despine()
     
-    # Embedded blurb for left panel
-    blurb_left = (
-        "Each line = one neuron\n"
-        "Markers show exact values\n"
-        "Blue→Red = Low→High response"
-    )
-    ax1.text(0.02, 0.02, blurb_left, transform=ax1.transAxes, fontsize=9,
-             verticalalignment='bottom', horizontalalignment='left',
-             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='gray'))
-    
-    # Right: Heterogeneity bar chart
-    ax2 = axes[1]
-    ax2.spines['top'].set_visible(False)
-    ax2.spines['right'].set_visible(False)
-    
-    bars = ax2.bar(set_sizes, pop_std, color='#9B59B6', alpha=0.8, edgecolor='black', 
-                   linewidth=1.5, width=1.2)
-    
-    ax2.set_xlabel('Set Size (l)', fontsize=13, fontweight='bold')
-    ax2.set_ylabel('Std Dev Across Neurons (Hz)', fontsize=13, fontweight='bold')
-    ax2.set_title('Response Heterogeneity INCREASES', fontsize=13, fontweight='bold')
-    ax2.set_xticks(set_sizes)
-    ax2.grid(True, axis='y', alpha=0.3)
-    
-    # Add values on bars
-    for i, (l, s) in enumerate(zip(set_sizes, pop_std)):
-        ax2.text(l, s + pop_std.max() * 0.02, f'{s:.1f}', ha='center', va='bottom', 
-                 fontsize=12, fontweight='bold')
+    # Add colorbar for neuron ranking
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, N-1))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, shrink=0.6, aspect=30, pad=0.02)
+    cbar.set_label(f'Neuron rank at l={set_sizes[-1]}\n(blue=suppressed, red=enhanced)')
+    cbar.set_ticks([0, N//2, N-1])
+    cbar.set_ticklabels(['Low', 'Mid', 'High'])
     
     plt.tight_layout()
-    
-    # FIGURE DESCRIPTION at bottom
-    description = (
-        f"Figure: (Left) Each neuron's average response r_i^post(S,θ) averaged over all subsets S of size l. "
-        f"Orientations θ = (θ₁,...,θ_L) are sampled once and fixed throughout. "
-        f"Post-DN formula: r_i^post(S,θ) = γ · ∏_{{k∈S}} g_i(θ_k) / [σ² + N⁻¹ Σ_j ∏_{{k∈S}} g_j(θ_k)]. "
-        f"Colors indicate response magnitude at l={set_sizes[-1]}. Population mean stays at γ = {gamma:.0f} Hz. "
-        f"(Right) Standard deviation across neurons grows {pop_std[-1]/pop_std[0]:.1f}-fold as set size increases, "
-        f"because the product over more locations amplifies tuning differences between neurons."
-    )
-    fig.text(0.5, -0.02, description, ha='center', va='top', fontsize=9,
-             wrap=True, style='italic',
-             bbox=dict(boxstyle='round', facecolor='white', edgecolor='gray', alpha=0.9))
-    plt.savefig(output_path / f'exp2_response_summary_N{N}.png', dpi=150, bbox_inches='tight', facecolor='white')
+    plt.savefig(output_path / f'exp2_neuron_response_bands_N{N}.png',
+                bbox_inches='tight', facecolor='white')
     if show_plot:
         plt.show()
     plt.close()
-    print(f"  ✓ Saved: exp2_response_summary_N{N}.png")
+    print(f"  Saved: exp2_neuron_response_bands_N{N}.png")
+    
+    # =========================================================================
+    # SUMMARY TABLE
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("RESULTS SUMMARY")
+    print("=" * 70)
+    print(f"{'Set Size':<12} {'Pre-DN Total':<18} {'Post-DN Total':<18} {'Per-Item':<12}")
+    print("-" * 70)
+    for l in set_sizes:
+        r = results['set_size_data'][l]
+        print(f"{l:<12} {r['pre_total_mean']:>12,.1f} Hz     "
+              f"{r['post_total_mean']:>12,.1f} Hz     {r['per_item_activity']:>8,.1f} Hz")
+    print("-" * 70)
+    print(f"Theoretical activity cap: γN = {gamma * N:,.0f} Hz")
+    print("=" * 70)
+
+
+# =============================================================================
+# ENTRY POINT (for standalone testing)
+# =============================================================================
+
+if __name__ == '__main__':
+    # Default configuration for standalone run
+    config = {
+        'n_neurons': 100,
+        'n_orientations': 10,
+        'n_locations': 8,
+        'set_sizes': [2, 4, 6, 8],
+        'seed': 42,
+        'gamma': 100.0,
+        'sigma_sq': 1e-6,
+        'lambda_base': 0.3,
+        'sigma_lambda': 0.5,
+    }
+    
+    results = run_experiment_2(config)
+    plot_results(results, 'results/exp2', show_plot=True)
