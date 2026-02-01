@@ -1,5 +1,5 @@
 """
-Experiment 4: Maximum Likelihood Decoding with GP Tuning Curves
+Experiment 4: Maximum Likelihood Decoding (v2.0 - DRY)
 
 =============================================================================
 PURPOSE
@@ -19,13 +19,14 @@ KEY OUTPUTS:
     4. Fisher Information scaling verification
 
 =============================================================================
-UNIFIED NEURON MODEL
+VERSION 2.0: DRY IMPLEMENTATION
 =============================================================================
 
-Uses the SAME GP-based tuning curves as other experiments:
-- Gaussian Process samples for heterogeneous tuning
-- Location-dependent lengthscales (mixed selectivity source)
-- Proper population divisive normalization
+Uses core modules properly:
+- core.gaussian_process: GP tuning curve generation
+- core.poisson_spike: Spike generation
+- core.ml_decoder: ML decoding and Fisher information
+- core.divisive_normalization: DN application
 
 Author: Mixed Selectivity Project
 Date: January 2026
@@ -36,20 +37,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple
 from dataclasses import dataclass
-import sys
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-# Try to import from core modules; if not available, functions are defined below
-try:
-    from core.gaussian_process import generate_neuron_population
-    from core.poisson_spike import generate_spikes, compute_theoretical_snr
-    CORE_AVAILABLE = True
-except ImportError:
-    CORE_AVAILABLE = False
+# Import from core modules (NO re-implementation)
+from core.gaussian_process import generate_neuron_population
+from core.poisson_spike import generate_spikes
+from core.ml_decoder import (
+    compute_log_likelihood,
+    decode_ml,
+    compute_circular_error,
+    compute_circular_std,
+    compute_fisher_information,
+    compute_cramer_rao_bound,
+    compute_tuning_curve_derivative,
+)
 
 # Optional progress bar
 try:
@@ -69,18 +71,16 @@ class Exp4Config:
     n_neurons: int = 100
     n_orientations: int = 64
     n_locations: int = 8
-    gamma: float = 20.0  # Lower gamma for visible errors
-    T_d: float = 0.25    # Longer window
+    gamma: float = 100.0
+    sigma_sq: float = 1e-6
+    T_d: float = 0.1
     n_trials: int = 500
     set_sizes: Tuple = (1, 2, 4, 8)
-    kappa: float = 2.0  # Not used for GP curves, kept for API compatibility
     seed: int = 42
     
     # GP parameters (matching other experiments)
     lambda_base: float = 0.5
     sigma_lambda: float = 0.3
-    gain_variability: float = 0.2
-    sigma_sq: float = 1e-6
     
     @property
     def total_activity(self) -> float:
@@ -88,138 +88,52 @@ class Exp4Config:
 
 
 # =============================================================================
-# GP TUNING CURVE GENERATION
+# TUNING CURVE GENERATION (using core.gaussian_process)
 # =============================================================================
 
-def generate_gp_tuning_population(cfg: Exp4Config, rng: np.random.RandomState) -> np.ndarray:
+def generate_orientation_tuning_curves(
+    cfg: Exp4Config,
+    rng: np.random.RandomState
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Generate population of GP-based tuning curves for orientation decoding.
+    Generate GP-based tuning curves for orientation decoding.
+    
+    Uses core.gaussian_process.generate_neuron_population for a single location,
+    then applies DN to normalize total activity to γN.
     
     Returns
     -------
     tuning_curves : np.ndarray, shape (N, n_orientations)
-        Firing rates f(θ) for each neuron (after DN normalization)
+        Post-DN firing rates f(θ) for each neuron
+    theta_values : np.ndarray, shape (n_orientations,)
+        Orientation values in radians
     """
-    orientations = np.linspace(0, 2*np.pi, cfg.n_orientations, endpoint=False)
+    # Generate population using core module
+    # We use location 0 only (single-location decoding task)
+    population = generate_neuron_population(
+        n_neurons=cfg.n_neurons,
+        n_orientations=cfg.n_orientations,
+        n_locations=1,  # Single location for orientation decoding
+        base_lengthscale=cfg.lambda_base,
+        lengthscale_variability=cfg.sigma_lambda,
+        seed=cfg.seed
+    )
+    
+    # Extract tuning curves for location 0
+    # f_samples shape: (n_locations, n_orientations) per neuron
     tuning_curves = np.zeros((cfg.n_neurons, cfg.n_orientations))
+    for i, neuron in enumerate(population):
+        f = neuron['f_samples'][0, :]  # Location 0
+        tuning_curves[i, :] = np.exp(f)  # Convert log-rate to rate
     
-    for n in range(cfg.n_neurons):
-        # Location-dependent lengthscale (heterogeneity source)
-        ls = cfg.lambda_base * np.abs(1.0 + cfg.sigma_lambda * rng.randn())
-        ls = max(ls, 0.15)  # Floor for numerical stability
-        
-        # Build periodic RBF kernel
-        theta_i, theta_j = np.meshgrid(orientations, orientations, indexing='ij')
-        dist = np.abs(theta_i - theta_j)
-        dist = np.minimum(dist, 2*np.pi - dist)
-        K = np.exp(-dist**2 / (2 * ls**2)) + 1e-4 * np.eye(cfg.n_orientations)
-        
-        # Sample GP
-        try:
-            L = np.linalg.cholesky(K)
-            f = L @ rng.randn(cfg.n_orientations)
-        except np.linalg.LinAlgError:
-            eigvals, eigvecs = np.linalg.eigh(K)
-            f = eigvecs @ (np.sqrt(np.maximum(eigvals, 1e-6)) * rng.randn(cfg.n_orientations))
-        
-        # Apply gain and convert to positive rates
-        gain = np.abs(1.0 + cfg.gain_variability * rng.randn())
-        tuning_curves[n, :] = np.exp(f * gain)
-    
-    # Apply DN: normalize so total activity = γN
+    # Apply divisive normalization: r_post = γ * r_pre / (σ² + mean(r_pre))
     pop_mean = np.mean(tuning_curves, axis=0, keepdims=True)
-    tuning_curves = cfg.gamma * tuning_curves / (pop_mean + cfg.sigma_sq)
+    tuning_curves = cfg.gamma * tuning_curves / (cfg.sigma_sq + pop_mean)
     
-    return tuning_curves
-
-
-# =============================================================================
-# ML DECODING FUNCTIONS
-# =============================================================================
-
-def compute_log_likelihood(
-    spike_counts: np.ndarray,
-    tuning_curves: np.ndarray,
-    T_d: float
-) -> np.ndarray:
-    """
-    Compute log-likelihood for all candidate stimulus values.
+    # Orientation values (must match what generate_neuron_population uses)
+    theta_values = population[0]['orientations']
     
-    ℓ(θ) = Σᵢ [ nᵢ · log(fᵢ(θ)) - fᵢ(θ)·T_d ]
-    """
-    tuning_safe = np.maximum(tuning_curves, 1e-10)
-    term1 = spike_counts[:, np.newaxis] * np.log(tuning_safe)
-    term2 = tuning_safe * T_d
-    return np.sum(term1 - term2, axis=0)
-
-
-def decode_ml(
-    spike_counts: np.ndarray,
-    tuning_curves: np.ndarray,
-    theta_values: np.ndarray,
-    T_d: float
-) -> Tuple[float, int, np.ndarray]:
-    """
-    Decode stimulus using maximum likelihood.
-    
-    Returns: (theta_ml, idx_ml, log_likelihood_curve)
-    """
-    ll = compute_log_likelihood(spike_counts, tuning_curves, T_d)
-    idx_ml = np.argmax(ll)
-    return theta_values[idx_ml], idx_ml, ll
-
-
-def compute_circular_error(theta_true: float, theta_est: float, period: float = 2*np.pi) -> float:
-    """Signed circular error wrapped to [-period/2, period/2)."""
-    error = theta_est - theta_true
-    return (error + period/2) % period - period/2
-
-
-def compute_circular_std(errors: np.ndarray) -> float:
-    """Circular standard deviation using resultant vector method."""
-    R = np.abs(np.mean(np.exp(1j * errors)))
-    if R > 1e-10:
-        return np.sqrt(-2 * np.log(R))
-    return np.pi
-
-
-# =============================================================================
-# FISHER INFORMATION & CRAMÉR-RAO BOUND
-# =============================================================================
-
-def compute_tuning_derivatives(tuning_curves: np.ndarray, theta_values: np.ndarray) -> np.ndarray:
-    """Compute numerical derivatives of tuning curves (periodic boundary)."""
-    d_theta = theta_values[1] - theta_values[0]
-    derivatives = np.zeros_like(tuning_curves)
-    
-    # Central difference with periodic boundary
-    derivatives[:, 1:-1] = (tuning_curves[:, 2:] - tuning_curves[:, :-2]) / (2 * d_theta)
-    derivatives[:, 0] = (tuning_curves[:, 1] - tuning_curves[:, -1]) / (2 * d_theta)
-    derivatives[:, -1] = (tuning_curves[:, 0] - tuning_curves[:, -2]) / (2 * d_theta)
-    
-    return derivatives
-
-
-def compute_fisher_information(
-    tuning_curves: np.ndarray,
-    tuning_derivatives: np.ndarray,
-    theta_idx: int,
-    T_d: float
-) -> float:
-    """
-    Compute Fisher Information at a specific stimulus value.
-    
-    I_F(θ) = T_d · Σᵢ [f'ᵢ(θ)]² / fᵢ(θ)
-    """
-    f = tuning_curves[:, theta_idx]
-    f_prime = tuning_derivatives[:, theta_idx]
-    f_safe = np.maximum(f, 1e-10)
-    return T_d * np.sum(f_prime**2 / f_safe)
-
-
-def compute_cramer_rao_bound(fisher_info: float) -> float:
-    """CR bound: Var[θ̂] ≥ 1/I_F"""
-    return 1.0 / max(fisher_info, 1e-10)
+    return tuning_curves, theta_values
 
 
 # =============================================================================
@@ -240,20 +154,19 @@ def run_experiment_4(config: Dict) -> Dict:
     results : Dict
         Complete experimental results
     """
-    # Convert dict to dataclass
     cfg = Exp4Config(
         n_neurons=config.get('n_neurons', 100),
         n_orientations=config.get('n_orientations', 64),
         gamma=config.get('gamma', 100.0),
+        sigma_sq=config.get('sigma_sq', 1e-6),
         T_d=config.get('T_d', 0.1),
         n_trials=config.get('n_trials', 500),
-        set_sizes=tuple(config.get('set_sizes', [1, 2, 4, 6, 8])),
-        kappa=config.get('kappa', 2.0),
+        set_sizes=tuple(config.get('set_sizes', [1, 2, 4, 8])),
         seed=config.get('seed', 42),
     )
     
     print("=" * 70)
-    print("EXPERIMENT 4: ML DECODING WITH GP TUNING CURVES")
+    print("EXPERIMENT 4: ML DECODING (v2.0 - DRY)")
     print("=" * 70)
     print(f"\nConfiguration:")
     print(f"  N = {cfg.n_neurons} neurons")
@@ -264,20 +177,19 @@ def run_experiment_4(config: Dict) -> Dict:
     print()
     
     rng = np.random.RandomState(cfg.seed)
-    theta_values = np.linspace(0, 2*np.pi, cfg.n_orientations, endpoint=False)
     
-    # Generate GP population (base tuning curves, DN normalized)
+    # Generate GP tuning curves (using core module)
     print("Generating GP tuning curves...")
-    base_tuning = generate_gp_tuning_population(cfg, rng)
+    base_tuning, theta_values = generate_orientation_tuning_curves(cfg, rng)
     
-    # Verify DN
+    # Verify DN normalization
     total_act = np.sum(np.mean(base_tuning, axis=1))
     print(f"  Total activity = {total_act:.1f} Hz (expected: {cfg.total_activity})")
     
-    # Compute derivatives for Fisher Information
-    tuning_derivatives = compute_tuning_derivatives(base_tuning, theta_values)
+    # Compute derivatives for Fisher Information (using core module)
+    tuning_derivatives = compute_tuning_curve_derivative(base_tuning, theta_values)
     
-    # Storage for results
+    # Storage
     decoding_results = {}
     theoretical_results = {
         'set_sizes': list(cfg.set_sizes),
@@ -286,20 +198,19 @@ def run_experiment_4(config: Dict) -> Dict:
         'cramer_rao_std_deg': [],
     }
     
-    # Run for each set size
     print(f"\nRunning ML decoding...")
     
     for l in tqdm(cfg.set_sizes, desc="Set sizes"):
-        # Scale tuning curves by 1/l (DN resource sharing)
+        # Scale tuning curves for set size: under DN, per-item rate = γN/l
+        # This is equivalent to scaling the tuning curves by 1/l
         scaled_tuning = base_tuning / l
         scaled_derivatives = tuning_derivatives / l
         
-        # Expected spikes per item
-        lambda_item = cfg.gamma * cfg.n_neurons * cfg.T_d / l
-        
-        # Compute Fisher Information (at middle of stimulus range)
+        # Compute Fisher Information at middle of stimulus range (using core module)
         theta_idx = cfg.n_orientations // 2
-        I_F = compute_fisher_information(scaled_tuning, scaled_derivatives, theta_idx, cfg.T_d)
+        I_F = compute_fisher_information(
+            scaled_tuning, scaled_derivatives, theta_idx, cfg.T_d
+        )
         cr_var = compute_cramer_rao_bound(I_F)
         cr_std_deg = np.degrees(np.sqrt(cr_var))
         
@@ -315,17 +226,19 @@ def run_experiment_4(config: Dict) -> Dict:
             theta_idx_true = rng.randint(0, cfg.n_orientations)
             theta_true = theta_values[theta_idx_true]
             
-            # Get rates and generate spikes
+            # Get rates at true stimulus
             rates = scaled_tuning[:, theta_idx_true]
-            spikes = rng.poisson(rates * cfg.T_d)
             
-            # ML decode
+            # Generate Poisson spikes (using core module)
+            spikes = generate_spikes(rates, cfg.T_d, rng)
+            
+            # ML decode (using core module)
             theta_est, _, _ = decode_ml(spikes, scaled_tuning, theta_values, cfg.T_d)
             
-            # Circular error
+            # Circular error (using core module)
             errors[trial] = compute_circular_error(theta_true, theta_est)
         
-        # Statistics
+        # Circular std (using core module)
         circ_std_rad = compute_circular_std(errors)
         circ_std_deg = np.degrees(circ_std_rad)
         
@@ -336,10 +249,10 @@ def run_experiment_4(config: Dict) -> Dict:
             'circular_std_rad': circ_std_rad,
             'circular_std_deg': circ_std_deg,
             'mean_abs_error_deg': np.degrees(np.mean(np.abs(errors))),
-            'lambda_item': lambda_item,
+            'lambda_item': cfg.gamma * cfg.n_neurons * cfg.T_d / l,
         }
     
-    # Print results table
+    # Print results
     print("\n" + "=" * 70)
     print("RESULTS: DECODING ERROR vs SET SIZE")
     print("=" * 70)
@@ -353,13 +266,14 @@ def run_experiment_4(config: Dict) -> Dict:
         lambda_item = decoding_results[l]['lambda_item']
         print(f"{l:<6} {lambda_item:<10.0f} {empirical:<14.2f} {theoretical:<14.2f} {ratio:<10.2f}")
     
-    # Compute √l scaling metrics
+    # Verify √l scaling
     stds = [decoding_results[l]['circular_std_deg'] for l in cfg.set_sizes]
     normalized = [s / np.sqrt(l) for s, l in zip(stds, cfg.set_sizes)]
+    cv = np.std(normalized) / np.mean(normalized)
     
     print(f"\n√l Scaling Check:")
     print(f"  Normalized stds: {[f'{n:.2f}' for n in normalized]}")
-    print(f"  CV of normalized: {np.std(normalized)/np.mean(normalized):.3f} (< 0.1 is good)")
+    print(f"  CV of normalized: {cv:.3f} (< 0.1 is good)")
     
     return {
         'config': config,
@@ -371,7 +285,7 @@ def run_experiment_4(config: Dict) -> Dict:
         'scaling': {
             'empirical_std': stds,
             'normalized_by_sqrt_l': normalized,
-            'cv_normalized': np.std(normalized) / np.mean(normalized),
+            'cv_normalized': cv,
         }
     }
 
@@ -385,61 +299,56 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    sns.set_theme(style="whitegrid", palette="muted")
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
+    palette = sns.color_palette("deep")
     
     cfg = results['exp_config']
     decoding = results['decoding']
     theoretical = results['theoretical']
     set_sizes = list(cfg.set_sizes)
     
-    # Extract data
     empirical_std = [decoding[l]['circular_std_deg'] for l in set_sizes]
     theoretical_std = theoretical['cramer_rao_std_deg']
     normalized = results['scaling']['normalized_by_sqrt_l']
     fisher_info = theoretical['fisher_info']
     
     # =========================================================================
-    # Figure 1: Error Scaling (2 panels)
+    # Figure 1: Error Scaling
     # =========================================================================
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     
     # Panel A: Error std vs set size
     ax = axes[0]
-    ax.plot(set_sizes, empirical_std, 'o-', color=sns.color_palette()[0],
+    ax.plot(set_sizes, empirical_std, 'o-', color=palette[0],
             lw=2.5, ms=10, label='Empirical (ML)')
-    ax.plot(set_sizes, theoretical_std, 's--', color=sns.color_palette()[1],
+    ax.plot(set_sizes, theoretical_std, 's--', color=palette[1],
             lw=2, ms=8, label='Cramér-Rao bound')
     
     # √l reference
     ref = [empirical_std[0] * np.sqrt(l / set_sizes[0]) for l in set_sizes]
     ax.plot(set_sizes, ref, ':', color='gray', lw=2, alpha=0.7, label='∝ √l')
     
-    ax.set_xlabel('Set Size (l)', fontsize=12)
-    ax.set_ylabel('Circular Std (degrees)', fontsize=12)
-    ax.set_title('A. Decoding Error Scales as √l', fontweight='bold')
-    ax.legend(fontsize=10)
+    ax.set_xlabel('Set Size (l)')
+    ax.set_ylabel('Circular Std (degrees)')
+    ax.set_title('A. Decoding Error Scales as √l')
+    ax.legend()
     ax.set_xticks(set_sizes)
+    sns.despine(ax=ax)
     
-    # Panel B: Normalized (flat = perfect √l)
+    # Panel B: Normalized
     ax = axes[1]
-    ax.plot(set_sizes, normalized, 'o-', color=sns.color_palette()[2],
-            lw=2.5, ms=10)
+    ax.plot(set_sizes, normalized, 'o-', color=palette[2], lw=2.5, ms=10)
     ax.axhline(np.mean(normalized), color='red', ls='--', lw=2,
                label=f'Mean = {np.mean(normalized):.2f}°')
-    ax.fill_between(set_sizes,
-                    np.mean(normalized) - np.std(normalized),
-                    np.mean(normalized) + np.std(normalized),
-                    alpha=0.2, color='red')
-    
-    ax.set_xlabel('Set Size (l)', fontsize=12)
-    ax.set_ylabel('Error Std / √l (degrees)', fontsize=12)
-    ax.set_title(f'B. √l Scaling Verified (CV = {results["scaling"]["cv_normalized"]:.3f})',
-                 fontweight='bold')
-    ax.legend(fontsize=10)
+    ax.set_xlabel('Set Size (l)')
+    ax.set_ylabel('Error Std / √l (degrees)')
+    ax.set_title(f'B. √l Scaling Verified (CV = {results["scaling"]["cv_normalized"]:.3f})')
+    ax.legend()
     ax.set_xticks(set_sizes)
+    sns.despine(ax=ax)
     
     plt.suptitle(f'Experiment 4: ML Decoding (N={cfg.n_neurons}, γ={cfg.gamma} Hz)',
-                 fontsize=13, fontweight='bold', y=1.02)
+                 fontsize=13, fontweight='bold')
     plt.tight_layout()
     plt.savefig(output_path / 'exp4_error_scaling.png', dpi=150, bbox_inches='tight')
     if show_plot:
@@ -461,21 +370,14 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
         sns.histplot(errors, kde=True, ax=ax, color=colors[i],
                      stat='density', alpha=0.6, bins=30)
         
-        # Gaussian reference
         std = decoding[l]['circular_std_deg']
-        x_range = np.linspace(-60, 60, 100)
-        gaussian = np.exp(-x_range**2 / (2*std**2)) / (std * np.sqrt(2*np.pi))
-        ax.plot(x_range, gaussian, 'k--', lw=1.5, alpha=0.7, label='Gaussian')
-        
-        ax.set_xlabel('Error (degrees)', fontsize=10)
-        ax.set_ylabel('Density' if i == 0 else '', fontsize=10)
-        ax.set_title(f'l = {l}\nσ = {std:.1f}°', fontweight='bold')
+        ax.set_xlabel('Error (degrees)')
+        ax.set_ylabel('Density' if i == 0 else '')
+        ax.set_title(f'l = {l}\nσ = {std:.1f}°')
         ax.set_xlim([-60, 60])
-        if i == 0:
-            ax.legend(fontsize=8)
     
     plt.suptitle('Experiment 4: Error Distributions Across Set Size',
-                 fontsize=13, fontweight='bold', y=1.02)
+                 fontsize=13, fontweight='bold')
     plt.tight_layout()
     plt.savefig(output_path / 'exp4_error_distributions.png', dpi=150, bbox_inches='tight')
     if show_plot:
@@ -488,39 +390,30 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     # =========================================================================
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     
-    # Panel A: Fisher Info vs set size
     ax = axes[0]
-    ax.plot(set_sizes, fisher_info, 'o-', color=sns.color_palette()[3],
-            lw=2.5, ms=10)
-    
-    # 1/l reference
+    ax.plot(set_sizes, fisher_info, 'o-', color=palette[3], lw=2.5, ms=10)
     ref_I = [fisher_info[0] * set_sizes[0] / l for l in set_sizes]
     ax.plot(set_sizes, ref_I, '--', color='gray', lw=2, alpha=0.7, label='∝ 1/l')
-    
-    ax.set_xlabel('Set Size (l)', fontsize=12)
-    ax.set_ylabel('Fisher Information', fontsize=12)
-    ax.set_title('A. Fisher Information ∝ 1/l', fontweight='bold')
-    ax.legend(fontsize=10)
+    ax.set_xlabel('Set Size (l)')
+    ax.set_ylabel('Fisher Information')
+    ax.set_title('A. Fisher Information ∝ 1/l')
+    ax.legend()
     ax.set_xticks(set_sizes)
+    sns.despine(ax=ax)
     
-    # Panel B: CR variance vs set size
     ax = axes[1]
     cr_var = theoretical['cramer_rao_var']
-    ax.plot(set_sizes, cr_var, 'o-', color=sns.color_palette()[4],
-            lw=2.5, ms=10)
-    
-    # l reference
+    ax.plot(set_sizes, cr_var, 'o-', color=palette[4], lw=2.5, ms=10)
     ref_var = [cr_var[0] * l / set_sizes[0] for l in set_sizes]
     ax.plot(set_sizes, ref_var, '--', color='gray', lw=2, alpha=0.7, label='∝ l')
-    
-    ax.set_xlabel('Set Size (l)', fontsize=12)
-    ax.set_ylabel('Cramér-Rao Variance', fontsize=12)
-    ax.set_title('B. Minimum Variance ∝ l', fontweight='bold')
-    ax.legend(fontsize=10)
+    ax.set_xlabel('Set Size (l)')
+    ax.set_ylabel('Cramér-Rao Variance')
+    ax.set_title('B. Minimum Variance ∝ l')
+    ax.legend()
     ax.set_xticks(set_sizes)
+    sns.despine(ax=ax)
     
-    plt.suptitle('Experiment 4: Theoretical Bounds',
-                 fontsize=13, fontweight='bold', y=1.02)
+    plt.suptitle('Experiment 4: Theoretical Bounds', fontsize=13, fontweight='bold')
     plt.tight_layout()
     plt.savefig(output_path / 'exp4_fisher_info.png', dpi=150, bbox_inches='tight')
     if show_plot:
@@ -529,53 +422,49 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     print(f"  ✓ Saved: exp4_fisher_info.png")
     
     # =========================================================================
-    # Figure 4: Summary (2x2)
+    # Figure 4: Summary
     # =========================================================================
     fig, axes = plt.subplots(2, 2, figsize=(11, 9))
     
-    # A: Error scaling
     ax = axes[0, 0]
     ax.plot(set_sizes, empirical_std, 'o-', lw=2.5, ms=10, label='Empirical')
     ax.plot(set_sizes, theoretical_std, 's--', lw=2, ms=7, label='CR bound')
     ax.set_xlabel('Set Size (l)')
     ax.set_ylabel('Error Std (degrees)')
-    ax.set_title('A. Error ∝ √l', fontweight='bold')
+    ax.set_title('A. Error ∝ √l')
     ax.legend()
     ax.set_xticks(set_sizes)
     
-    # B: Distribution comparison
     ax = axes[0, 1]
     l_low, l_high = set_sizes[0], set_sizes[-1]
     sns.kdeplot(decoding[l_low]['errors_deg'], ax=ax, lw=2, label=f'l={l_low}')
     sns.kdeplot(decoding[l_high]['errors_deg'], ax=ax, lw=2, label=f'l={l_high}')
     ax.set_xlabel('Error (degrees)')
     ax.set_ylabel('Density')
-    ax.set_title('B. Distributions Widen with Load', fontweight='bold')
+    ax.set_title('B. Distributions Widen with Load')
     ax.legend()
     ax.set_xlim([-60, 60])
     
-    # C: Fisher Information
     ax = axes[1, 0]
-    ax.plot(set_sizes, fisher_info, 'o-', color=sns.color_palette()[3], lw=2.5, ms=10)
+    ax.plot(set_sizes, fisher_info, 'o-', color=palette[3], lw=2.5, ms=10)
     ax.set_xlabel('Set Size (l)')
     ax.set_ylabel('Fisher Information')
-    ax.set_title('C. Information ∝ 1/l', fontweight='bold')
+    ax.set_title('C. Information ∝ 1/l')
     ax.set_xticks(set_sizes)
     
-    # D: Decoder efficiency
     ax = axes[1, 1]
     efficiency = [theoretical_std[i] / empirical_std[i] for i in range(len(set_sizes))]
-    ax.bar(set_sizes, efficiency, color=sns.color_palette()[5], alpha=0.7, edgecolor='black')
+    ax.bar(set_sizes, efficiency, color=palette[5], alpha=0.7, edgecolor='black')
     ax.axhline(1.0, color='red', ls='--', lw=2, label='Optimal')
     ax.set_xlabel('Set Size (l)')
     ax.set_ylabel('Efficiency (CR / Empirical)')
-    ax.set_title('D. Decoder Efficiency', fontweight='bold')
+    ax.set_title('D. Decoder Efficiency')
     ax.set_ylim([0, 1.2])
     ax.legend()
     ax.set_xticks(set_sizes)
     
     plt.suptitle(f'Experiment 4 Summary (N={cfg.n_neurons}, T_d={cfg.T_d}s)',
-                 fontsize=13, fontweight='bold', y=1.02)
+                 fontsize=13, fontweight='bold')
     plt.tight_layout()
     plt.savefig(output_path / 'exp4_summary.png', dpi=150, bbox_inches='tight')
     if show_plot:
@@ -585,47 +474,20 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
 
 
 # =============================================================================
-# MAIN (standalone execution)
+# STANDALONE ENTRY POINT
 # =============================================================================
 
-def main():
-    """Standalone execution."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Experiment 4: ML Decoding')
-    parser.add_argument('--n_neurons', type=int, default=100)
-    parser.add_argument('--n_orientations', type=int, default=64)
-    parser.add_argument('--gamma', type=float, default=100.0)
-    parser.add_argument('--T_d', type=float, default=0.1)
-    parser.add_argument('--n_trials', type=int, default=500)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--output_dir', type=str, default='results/exp4')
-    parser.add_argument('--show', action='store_true')
-    
-    args = parser.parse_args()
-    
+if __name__ == '__main__':
     config = {
-        'n_neurons': args.n_neurons,
-        'n_orientations': args.n_orientations,
-        'gamma': args.gamma,
-        'T_d': args.T_d,
-        'n_trials': args.n_trials,
-        'seed': args.seed,
-        'set_sizes': [1, 2, 4, 6, 8],
-        'kappa': 2.0,
+        'n_neurons': 100,
+        'n_orientations': 64,
+        'gamma': 100.0,
+        'sigma_sq': 1e-6,
+        'T_d': 0.1,
+        'n_trials': 500,
+        'seed': 42,
+        'set_sizes': [1, 2, 4, 8],
     }
     
     results = run_experiment_4(config)
-    plot_results(results, args.output_dir, show_plot=args.show)
-    
-    print("\n" + "=" * 70)
-    print("EXPERIMENT 4 COMPLETE")
-    print("=" * 70)
-    print(f"\n📁 Output: {args.output_dir}/")
-    print("\n🔬 THE CAUSAL CHAIN:")
-    print("   DN caps activity → Per-item rate ∝ 1/l → λ ∝ 1/l")
-    print("   → SNR ∝ 1/√l → I_F ∝ 1/l → Error std ∝ √l")
-
-
-if __name__ == '__main__':
-    main()
+    plot_results(results, 'results/exp4', show_plot=True)

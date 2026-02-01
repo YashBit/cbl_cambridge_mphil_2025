@@ -45,14 +45,12 @@ def periodic_rbf_kernel(
         Covariance matrix, shape (n_theta, n_theta)
     """
     n_theta = len(orientations)
-    K = np.zeros((n_theta, n_theta))
     
-    for i in range(n_theta):
-        for j in range(n_theta):
-            # Circular distance on [-π, π]
-            dist = np.abs(orientations[i] - orientations[j])
-            dist = np.minimum(dist, 2 * np.pi - dist)
-            K[i, j] = np.exp(-dist**2 / (2 * lengthscale**2))
+    # Vectorized computation
+    theta_i, theta_j = np.meshgrid(orientations, orientations, indexing='ij')
+    dist = np.abs(theta_i - theta_j)
+    dist = np.minimum(dist, 2 * np.pi - dist)
+    K = np.exp(-dist**2 / (2 * lengthscale**2))
     
     # Add jitter for numerical stability
     K += jitter * np.eye(n_theta)
@@ -67,7 +65,9 @@ def sample_gp_function(
     """
     Sample a function from a Gaussian Process with covariance K.
     
-    Uses Cholesky decomposition: f = L @ z where L = chol(K), z ~ N(0, I)
+    Uses Cholesky decomposition with eigenvalue fallback for numerical stability:
+    - Primary: f = L @ z where L = chol(K), z ~ N(0, I)
+    - Fallback: f = V @ (sqrt(λ) * z) using eigendecomposition
     
     Parameters
     ----------
@@ -81,9 +81,19 @@ def sample_gp_function(
     f : np.ndarray
         GP sample, shape (n_theta,)
     """
-    L = np.linalg.cholesky(K)
-    z = random_state.randn(K.shape[0])
-    return L @ z
+    n = K.shape[0]
+    z = random_state.randn(n)
+    
+    try:
+        # Try Cholesky first (faster, more stable when it works)
+        L = np.linalg.cholesky(K)
+        return L @ z
+    except np.linalg.LinAlgError:
+        # Fallback to eigendecomposition (always works for symmetric matrices)
+        eigvals, eigvecs = np.linalg.eigh(K)
+        # Clamp negative eigenvalues to small positive value
+        eigvals = np.maximum(eigvals, 1e-10)
+        return eigvecs @ (np.sqrt(eigvals) * z)
 
 
 # ============================================================================
@@ -122,7 +132,10 @@ def generate_location_dependent_lengthscales(
     """
     random_factors = 1.0 + variability * random_state.randn(n_locations)
     random_factors = np.abs(random_factors)  # Ensure positive
-    return base_lengthscale * random_factors
+    # Ensure minimum lengthscale for numerical stability
+    lengthscales = base_lengthscale * random_factors
+    lengthscales = np.maximum(lengthscales, 0.1)  # Floor at 0.1
+    return lengthscales
 
 
 # ============================================================================
@@ -174,7 +187,7 @@ def generate_neuron_tuning_curves(
             Gain factors applied to each location
     """
     # Create orientation grid
-    orientations = np.linspace(-np.pi, np.pi, n_orientations)
+    orientations = np.linspace(-np.pi, np.pi, n_orientations, endpoint=False)
     
     # Generate location-dependent lengthscales
     lengthscales = generate_location_dependent_lengthscales(
@@ -189,7 +202,7 @@ def generate_neuron_tuning_curves(
         # Build kernel with this location's lengthscale
         K = periodic_rbf_kernel(orientations, lengthscales[loc])
         
-        # Sample GP function
+        # Sample GP function (with robust fallback)
         f_loc = sample_gp_function(K, random_state)
         
         # Apply gain modulation
