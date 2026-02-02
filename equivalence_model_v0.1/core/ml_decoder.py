@@ -1,630 +1,579 @@
 """
-Maximum Likelihood Decoding - Core Module
+Experiment 4: Multi-Item ML Decoding with Marginalisation
 
 =============================================================================
-THEORETICAL FOUNDATION
+PURPOSE
 =============================================================================
 
-THE DECODING PROBLEM
---------------------
-Given observed spike counts n = (n₁, n₂, ..., n_N) from N neurons,
-estimate the stimulus θ that caused this pattern.
+Demonstrates ML decoding with marginalisation for multi-item working memory,
+completing the full pipeline from GP tuning curves → DN → Poisson spikes → ML decode.
 
-THE LIKELIHOOD FUNCTION
------------------------
-For independent Poisson neurons with tuning curves f_i(θ):
+THE COMPLETE CAUSAL CHAIN:
+    GP tuning (mixed selectivity) → DN caps activity → Poisson spikes
+    → Joint likelihood tensor → Marginalise over non-cued items → ML decode
 
-    P(n | θ) = ∏ᵢ [f_i(θ)·T_d]^{n_i} · exp(-f_i(θ)·T_d) / n_i!
-
-THE LOG-LIKELIHOOD
-------------------
-    ℓ(θ) = Σᵢ [ n_i · log(f_i(θ)) - f_i(θ)·T_d ]
-
-    (ignoring constant terms that don't depend on θ)
-
-THE ML ESTIMATE
----------------
-    θ̂_ML = argmax_θ ℓ(θ)
-
-OPTIMALITY PROPERTIES (asymptotic)
-----------------------------------
-    1. Consistent: θ̂ → θ_true as N → ∞
-    2. Efficient: Var[θ̂] → 1/I_F (achieves Cramér-Rao bound)
-    3. Normal: θ̂ - θ ~ N(0, 1/I_F) for large N
+KEY OUTPUTS:
+    1. Decoding error distributions at each set size
+    2. Error std scaling with set size (√ℓ law)
+    3. Comparison: single-item vs multi-item (marginalised) decoder
+    4. Fisher Information and Cramér-Rao bound verification
 
 =============================================================================
 """
 
 import numpy as np
-from typing import Tuple, Optional, Callable, Dict
+from pathlib import Path
+from typing import Dict, Tuple, List
 from dataclasses import dataclass
+
+from core.gaussian_process import generate_neuron_population
+from core.poisson_spike import generate_spikes
+from core.ml_decoder import (
+    compute_log_likelihood,
+    decode_ml,
+    compute_circular_error,
+    compute_circular_std,
+    compute_fisher_information,
+    compute_cramer_rao_bound,
+    compute_tuning_curve_derivative,
+    build_tuning_tensor,
+    apply_dn_to_tensor,
+    decode_ml_multi_item,
+)
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **kwargs):
+        return x
 
 
 # =============================================================================
-# DATA STRUCTURES
+# CONFIGURATION
 # =============================================================================
 
 @dataclass
-class DecodingResult:
-    """Result of ML decoding for a single trial."""
-    theta_true: float           # True stimulus value
-    theta_estimate: float       # ML estimate
-    error: float                # θ̂ - θ (signed error)
-    log_likelihood_max: float   # Log-likelihood at estimate
-    log_likelihood_true: float  # Log-likelihood at true value
-
-
-@dataclass 
-class PopulationDecodingResult:
-    """Results of ML decoding across multiple trials."""
-    theta_true: np.ndarray          # Shape (n_trials,)
-    theta_estimates: np.ndarray     # Shape (n_trials,)
-    errors: np.ndarray              # Shape (n_trials,)
-    mean_absolute_error: float
-    std_error: float
-    circular_std: float             # For circular variables
+class Exp4Config:
+    """Configuration for Experiment 4."""
+    # Population parameters
+    n_neurons: int = 100
+    n_orientations: int = 32
+    n_locations: int = 8
     
-
-# =============================================================================
-# CORE LOG-LIKELIHOOD COMPUTATION
-# =============================================================================
-
-def compute_log_likelihood(
-    spike_counts: np.ndarray,
-    tuning_curves: np.ndarray,
-    T_d: float
-) -> np.ndarray:
-    """
-    Compute log-likelihood for all candidate stimulus values.
-    
-    ℓ(θ) = Σᵢ [ n_i · log(f_i(θ)) - f_i(θ)·T_d ]
-    
-    Parameters
-    ----------
-    spike_counts : np.ndarray
-        Observed spike counts, shape (N,) where N = number of neurons
-    tuning_curves : np.ndarray
-        Tuning curves f_i(θ), shape (N, n_theta) where n_theta = number of 
-        stimulus values to evaluate
-    T_d : float
-        Decoding time window in seconds
-        
-    Returns
-    -------
-    log_likelihood : np.ndarray
-        Log-likelihood at each stimulus value, shape (n_theta,)
-    """
-    # Ensure numerical stability
-    tuning_curves_safe = np.maximum(tuning_curves, 1e-10)
-    
-    # ℓ(θ) = Σᵢ [ n_i · log(f_i(θ)) - f_i(θ)·T_d ]
-    # spike_counts: (N,) -> (N, 1) for broadcasting
-    # tuning_curves_safe: (N, n_theta)
-    
-    term1 = spike_counts[:, np.newaxis] * np.log(tuning_curves_safe)  # (N, n_theta)
-    term2 = tuning_curves_safe * T_d  # (N, n_theta)
-    
-    # Sum over neurons
-    log_likelihood = np.sum(term1 - term2, axis=0)  # (n_theta,)
-    
-    return log_likelihood
-
-
-def compute_log_likelihood_single(
-    spike_counts: np.ndarray,
-    rates: np.ndarray,
-    T_d: float
-) -> float:
-    """
-    Compute log-likelihood for a single stimulus value.
-    
-    Parameters
-    ----------
-    spike_counts : np.ndarray
-        Observed spike counts, shape (N,)
-    rates : np.ndarray
-        Firing rates at the candidate stimulus, shape (N,)
-    T_d : float
-        Decoding time window
-        
-    Returns
-    -------
-    log_likelihood : float
-        Log-likelihood value
-    """
-    rates_safe = np.maximum(rates, 1e-10)
-    return float(np.sum(spike_counts * np.log(rates_safe) - rates_safe * T_d))
-
-
-# =============================================================================
-# MAXIMUM LIKELIHOOD ESTIMATION
-# =============================================================================
-
-def decode_ml(
-    spike_counts: np.ndarray,
-    tuning_curves: np.ndarray,
-    theta_values: np.ndarray,
-    T_d: float
-) -> Tuple[float, float, np.ndarray]:
-    """
-    Decode stimulus using maximum likelihood (grid search).
-    
-    θ̂_ML = argmax_θ ℓ(θ)
-    
-    Parameters
-    ----------
-    spike_counts : np.ndarray
-        Observed spike counts, shape (N,)
-    tuning_curves : np.ndarray
-        Tuning curves f_i(θ), shape (N, n_theta)
-    theta_values : np.ndarray
-        Stimulus values corresponding to tuning curve columns, shape (n_theta,)
-    T_d : float
-        Decoding time window
-        
-    Returns
-    -------
-    theta_ml : float
-        Maximum likelihood estimate
-    log_likelihood_max : float
-        Log-likelihood at the ML estimate
-    log_likelihood_curve : np.ndarray
-        Full log-likelihood curve, shape (n_theta,)
-    """
-    log_likelihood = compute_log_likelihood(spike_counts, tuning_curves, T_d)
-    
-    idx_max = np.argmax(log_likelihood)
-    theta_ml = theta_values[idx_max]
-    log_likelihood_max = log_likelihood[idx_max]
-    
-    return theta_ml, log_likelihood_max, log_likelihood
-
-
-def decode_ml_circular(
-    spike_counts: np.ndarray,
-    tuning_curves: np.ndarray,
-    theta_values: np.ndarray,
-    T_d: float
-) -> Tuple[float, float, np.ndarray]:
-    """
-    Decode circular stimulus (e.g., orientation) using ML.
-    
-    Same as decode_ml but handles circular variable properly.
-    Theta values assumed to be in radians, spanning [0, 2π) or [-π, π).
-    
-    Parameters
-    ----------
-    spike_counts : np.ndarray
-        Observed spike counts, shape (N,)
-    tuning_curves : np.ndarray
-        Tuning curves f_i(θ), shape (N, n_theta)
-    theta_values : np.ndarray
-        Stimulus values in radians, shape (n_theta,)
-    T_d : float
-        Decoding time window
-        
-    Returns
-    -------
-    theta_ml : float
-        Maximum likelihood estimate (in radians)
-    log_likelihood_max : float
-        Log-likelihood at the ML estimate
-    log_likelihood_curve : np.ndarray
-        Full log-likelihood curve
-    """
-    # For circular variables, the grid search is the same
-    # The difference is in how we compute errors (use circular_error)
-    return decode_ml(spike_counts, tuning_curves, theta_values, T_d)
-
-
-# =============================================================================
-# ERROR COMPUTATION
-# =============================================================================
-
-def compute_error(theta_true: float, theta_estimate: float) -> float:
-    """
-    Compute signed decoding error (linear variable).
-    
-    Parameters
-    ----------
-    theta_true : float
-        True stimulus value
-    theta_estimate : float
-        Estimated stimulus value
-        
-    Returns
-    -------
-    error : float
-        Signed error (estimate - true)
-    """
-    return theta_estimate - theta_true
-
-
-def compute_circular_error(
-    theta_true: float, 
-    theta_estimate: float,
-    period: float = 2 * np.pi
-) -> float:
-    """
-    Compute signed decoding error for circular variable.
-    
-    Wraps error to [-period/2, period/2).
-    
-    Parameters
-    ----------
-    theta_true : float
-        True stimulus value (radians)
-    theta_estimate : float
-        Estimated stimulus value (radians)
-    period : float
-        Period of the circular variable (default: 2π)
-        
-    Returns
-    -------
-    error : float
-        Signed circular error
-    """
-    error = theta_estimate - theta_true
-    # Wrap to [-period/2, period/2)
-    error = (error + period/2) % period - period/2
-    return error
-
-
-def compute_circular_std(errors: np.ndarray, period: float = 2 * np.pi) -> float:
-    """
-    Compute circular standard deviation.
-    
-    Uses the resultant vector length method:
-    R = |mean(exp(i·θ))|
-    circular_std = sqrt(-2·log(R)) · (period / 2π)
-    
-    Parameters
-    ----------
-    errors : np.ndarray
-        Array of circular errors
-    period : float
-        Period of the circular variable
-        
-    Returns
-    -------
-    circ_std : float
-        Circular standard deviation (same units as period)
-    """
-    # Convert to unit circle
-    phases = 2 * np.pi * errors / period
-    
-    # Resultant vector
-    R = np.abs(np.mean(np.exp(1j * phases)))
-    
-    # Circular std (in radians on unit circle)
-    if R > 1e-10:
-        circ_std_radians = np.sqrt(-2 * np.log(R))
-    else:
-        circ_std_radians = np.pi  # Maximum dispersion
-    
-    # Convert back to original units
-    circ_std = circ_std_radians * period / (2 * np.pi)
-    
-    return circ_std
-
-
-# =============================================================================
-# BATCH DECODING (MULTIPLE TRIALS)
-# =============================================================================
-
-def decode_batch(
-    spike_counts_batch: np.ndarray,
-    tuning_curves: np.ndarray,
-    theta_values: np.ndarray,
-    theta_true_batch: np.ndarray,
-    T_d: float,
-    circular: bool = True
-) -> PopulationDecodingResult:
-    """
-    Decode multiple trials and compute error statistics.
-    
-    Parameters
-    ----------
-    spike_counts_batch : np.ndarray
-        Spike counts for multiple trials, shape (n_trials, N)
-    tuning_curves : np.ndarray
-        Tuning curves, shape (N, n_theta)
-    theta_values : np.ndarray
-        Stimulus values, shape (n_theta,)
-    theta_true_batch : np.ndarray
-        True stimulus for each trial, shape (n_trials,)
-    T_d : float
-        Decoding time window
-    circular : bool
-        Whether the stimulus variable is circular
-        
-    Returns
-    -------
-    result : PopulationDecodingResult
-        Decoding results and statistics
-    """
-    n_trials = spike_counts_batch.shape[0]
-    theta_estimates = np.zeros(n_trials)
-    errors = np.zeros(n_trials)
-    
-    period = theta_values[-1] - theta_values[0] + (theta_values[1] - theta_values[0])
-    
-    for trial in range(n_trials):
-        theta_ml, _, _ = decode_ml(
-            spike_counts_batch[trial],
-            tuning_curves,
-            theta_values,
-            T_d
-        )
-        theta_estimates[trial] = theta_ml
-        
-        if circular:
-            errors[trial] = compute_circular_error(
-                theta_true_batch[trial], theta_ml, period
-            )
-        else:
-            errors[trial] = compute_error(theta_true_batch[trial], theta_ml)
-    
-    # Compute statistics
-    mean_abs_error = np.mean(np.abs(errors))
-    std_error = np.std(errors)
-    circ_std = compute_circular_std(errors, period) if circular else std_error
-    
-    return PopulationDecodingResult(
-        theta_true=theta_true_batch,
-        theta_estimates=theta_estimates,
-        errors=errors,
-        mean_absolute_error=mean_abs_error,
-        std_error=std_error,
-        circular_std=circ_std
-    )
-
-
-# =============================================================================
-# FISHER INFORMATION & CRAMÉR-RAO BOUND
-# =============================================================================
-
-def compute_fisher_information(
-    tuning_curves: np.ndarray,
-    tuning_curve_derivatives: np.ndarray,
-    theta_idx: int,
-    T_d: float
-) -> float:
-    """
-    Compute Fisher Information at a specific stimulus value.
-    
-    I_F(θ) = T_d · Σᵢ [f'_i(θ)]² / f_i(θ)
-    
-    Parameters
-    ----------
-    tuning_curves : np.ndarray
-        Tuning curves f_i(θ), shape (N, n_theta)
-    tuning_curve_derivatives : np.ndarray
-        Derivatives f'_i(θ), shape (N, n_theta)
-    theta_idx : int
-        Index of stimulus value at which to compute I_F
-    T_d : float
-        Decoding time window
-        
-    Returns
-    -------
-    I_F : float
-        Fisher Information
-    """
-    f = tuning_curves[:, theta_idx]
-    f_prime = tuning_curve_derivatives[:, theta_idx]
-    
-    f_safe = np.maximum(f, 1e-10)
-    
-    I_F = T_d * np.sum(f_prime**2 / f_safe)
-    
-    return float(I_F)
-
-
-def compute_cramer_rao_bound(fisher_information: float) -> float:
-    """
-    Compute Cramér-Rao lower bound on estimation variance.
-    
-    Var[θ̂] ≥ 1 / I_F(θ)
-    
-    Parameters
-    ----------
-    fisher_information : float
-        Fisher Information I_F(θ)
-        
-    Returns
-    -------
-    min_variance : float
-        Minimum achievable variance
-    """
-    return 1.0 / max(fisher_information, 1e-10)
-
-
-def compute_tuning_curve_derivative(
-    tuning_curves: np.ndarray,
-    theta_values: np.ndarray
-) -> np.ndarray:
-    """
-    Compute numerical derivative of tuning curves.
-    
-    Parameters
-    ----------
-    tuning_curves : np.ndarray
-        Tuning curves, shape (N, n_theta)
-    theta_values : np.ndarray
-        Stimulus values, shape (n_theta,)
-        
-    Returns
-    -------
-    derivatives : np.ndarray
-        Tuning curve derivatives, shape (N, n_theta)
-    """
-    d_theta = theta_values[1] - theta_values[0]
-    
-    # Central difference with periodic boundary (for circular variables)
-    derivatives = np.zeros_like(tuning_curves)
-    derivatives[:, 1:-1] = (tuning_curves[:, 2:] - tuning_curves[:, :-2]) / (2 * d_theta)
-    
-    # Periodic boundaries
-    derivatives[:, 0] = (tuning_curves[:, 1] - tuning_curves[:, -1]) / (2 * d_theta)
-    derivatives[:, -1] = (tuning_curves[:, 0] - tuning_curves[:, -2]) / (2 * d_theta)
-    
-    return derivatives
-
-
-# =============================================================================
-# TUNING CURVE UTILITIES
-# =============================================================================
-
-def create_von_mises_tuning_curves(
-    preferred_orientations: np.ndarray,
-    theta_values: np.ndarray,
-    kappa: float,
-    peak_rate: float
-) -> np.ndarray:
-    """
-    Create von Mises (circular Gaussian) tuning curves.
-    
-    f_i(θ) = peak_rate · exp(κ · (cos(θ - θ_pref_i) - 1))
-    
-    Parameters
-    ----------
-    preferred_orientations : np.ndarray
-        Preferred orientation for each neuron, shape (N,)
-    theta_values : np.ndarray
-        Stimulus values to evaluate, shape (n_theta,)
-    kappa : float
-        Concentration parameter (higher = narrower tuning)
-    peak_rate : float
-        Maximum firing rate (Hz)
-        
-    Returns
-    -------
-    tuning_curves : np.ndarray
-        Tuning curves, shape (N, n_theta)
-    """
-    N = len(preferred_orientations)
-    n_theta = len(theta_values)
-    
-    # Broadcast: (N, 1) - (1, n_theta) = (N, n_theta)
-    theta_diff = preferred_orientations[:, np.newaxis] - theta_values[np.newaxis, :]
-    
-    tuning_curves = peak_rate * np.exp(kappa * (np.cos(theta_diff) - 1))
-    
-    return tuning_curves
-
-
-def create_uniform_population(
-    N: int,
-    theta_values: np.ndarray,
-    kappa: float,
-    peak_rate: float
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Create a population with uniformly distributed preferred orientations.
-    
-    Parameters
-    ----------
-    N : int
-        Number of neurons
-    theta_values : np.ndarray
-        Stimulus values, shape (n_theta,)
-    kappa : float
-        Tuning concentration
-    peak_rate : float
-        Peak firing rate
-        
-    Returns
-    -------
-    tuning_curves : np.ndarray
-        Tuning curves, shape (N, n_theta)
-    preferred_orientations : np.ndarray
-        Preferred orientations, shape (N,)
-    """
-    # Uniformly tile the stimulus space
-    theta_range = theta_values[-1] - theta_values[0] + (theta_values[1] - theta_values[0])
-    preferred_orientations = np.linspace(
-        theta_values[0], 
-        theta_values[0] + theta_range * (N-1) / N, 
-        N
-    )
-    
-    tuning_curves = create_von_mises_tuning_curves(
-        preferred_orientations, theta_values, kappa, peak_rate
-    )
-    
-    return tuning_curves, preferred_orientations
-
-
-# =============================================================================
-# DIVISIVE NORMALIZATION INTEGRATION
-# =============================================================================
-
-def apply_divisive_normalization(
-    tuning_curves: np.ndarray,
-    gamma: float,
+    # DN parameters
+    gamma: float = 100.0
     sigma_sq: float = 1e-6
-) -> np.ndarray:
-    """
-    Apply divisive normalization to tuning curves.
     
-    r_i^post(θ) = γ · f_i(θ) / (σ² + N⁻¹ · Σⱼ f_j(θ))
+    # Decoding parameters
+    T_d: float = 0.1
+    n_trials: int = 500
+    set_sizes: Tuple = (1, 2, 4)
+    
+    # GP parameters
+    lambda_base: float = 0.5
+    sigma_lambda: float = 0.3
+    
+    # Random seed
+    seed: int = 42
+    
+    @property
+    def total_activity(self) -> float:
+        return self.gamma * self.n_neurons
+
+
+# =============================================================================
+# POPULATION SETUP
+# =============================================================================
+
+def setup_population(cfg: Exp4Config) -> Tuple[List[Dict], np.ndarray]:
+    """
+    Generate GP-based neural population with mixed selectivity.
+    
+    Returns
+    -------
+    population : List[Dict]
+        List of neuron dictionaries with f_samples, lengthscales, etc.
+    theta_values : np.ndarray
+        Orientation values in radians
+    """
+    population = generate_neuron_population(
+        n_neurons=cfg.n_neurons,
+        n_orientations=cfg.n_orientations,
+        n_locations=cfg.n_locations,
+        base_lengthscale=cfg.lambda_base,
+        lengthscale_variability=cfg.sigma_lambda,
+        seed=cfg.seed
+    )
+    theta_values = population[0]['orientations']
+    return population, theta_values
+
+
+def extract_f_samples_for_locations(
+    population: List[Dict],
+    active_locations: Tuple[int, ...]
+) -> List[np.ndarray]:
+    """
+    Extract log-rate tuning functions for active locations.
+    
+    Returns
+    -------
+    f_samples_per_location : List[np.ndarray]
+        List of ℓ arrays, each shape (N, n_theta)
+    """
+    N = len(population)
+    n_theta = population[0]['f_samples'].shape[1]
+    ell = len(active_locations)
+    
+    f_samples_list = []
+    for k, loc in enumerate(active_locations):
+        f_k = np.zeros((N, n_theta))
+        for i, neuron in enumerate(population):
+            f_k[i, :] = neuron['f_samples'][loc, :]
+        f_samples_list.append(f_k)
+    
+    return f_samples_list
+
+
+# =============================================================================
+# SINGLE-TRIAL DECODING
+# =============================================================================
+
+def run_single_trial_multi_item(
+    population: List[Dict],
+    theta_values: np.ndarray,
+    cfg: Exp4Config,
+    active_locations: Tuple[int, ...],
+    true_orientations: np.ndarray,
+    cued_index: int,
+    rng: np.random.RandomState
+) -> Dict:
+    """
+    Run a single trial of multi-item decoding.
     
     Parameters
     ----------
-    tuning_curves : np.ndarray
-        Pre-normalized tuning curves, shape (N, n_theta)
-    gamma : float
-        Gain constant
-    sigma_sq : float
-        Semi-saturation constant
-        
+    population : List[Dict]
+    theta_values : np.ndarray
+    cfg : Exp4Config
+    active_locations : Tuple[int, ...]
+        Indices of active locations
+    true_orientations : np.ndarray, shape (ℓ,)
+        True orientation at each active location (radians)
+    cued_index : int
+        Which active location is cued (0-indexed within active set)
+    rng : np.random.RandomState
+    
     Returns
     -------
-    normalized_curves : np.ndarray
-        Post-DN tuning curves, shape (N, n_theta)
+    result : Dict with theta_true, theta_estimate, error, etc.
     """
-    N = tuning_curves.shape[0]
+    ell = len(active_locations)
+    N = len(population)
     
-    # Population mean at each stimulus
-    population_mean = np.mean(tuning_curves, axis=0, keepdims=True)  # (1, n_theta)
+    # Get f_samples for active locations
+    f_samples_list = extract_f_samples_for_locations(population, active_locations)
     
-    # Divisive normalization
-    denominator = sigma_sq + population_mean
-    normalized_curves = gamma * tuning_curves / denominator
+    # Build joint tuning tensor: shape (N, n_theta, ..., n_theta)
+    tuning_tensor = build_tuning_tensor(f_samples_list)
     
-    return normalized_curves
+    # Apply DN
+    tuning_tensor = apply_dn_to_tensor(tuning_tensor, cfg.gamma, cfg.sigma_sq)
+    
+    # Get true orientation indices
+    theta_indices = [np.argmin(np.abs(theta_values - t)) for t in true_orientations]
+    
+    # Get firing rates at true joint stimulus configuration
+    # Index into tensor: tuning_tensor[:, θ_1, θ_2, ..., θ_ℓ]
+    idx_tuple = (slice(None),) + tuple(theta_indices)
+    rates_at_true = tuning_tensor[idx_tuple]  # shape (N,)
+    
+    # Generate Poisson spikes
+    spike_counts = generate_spikes(rates_at_true, cfg.T_d, rng)
+    
+    # Decode with marginalisation
+    theta_ml, ll_max, ll_marginal = decode_ml_multi_item(
+        spike_counts, tuning_tensor, theta_values, cfg.T_d, cued_index
+    )
+    
+    # Compute error
+    theta_true = true_orientations[cued_index]
+    error = compute_circular_error(theta_true, theta_ml)
+    
+    return {
+        'theta_true': theta_true,
+        'theta_estimate': theta_ml,
+        'error': error,
+        'spike_counts': spike_counts,
+        'total_spikes': np.sum(spike_counts),
+        'mean_rate': np.mean(rates_at_true),
+    }
 
 
-def scale_tuning_curves_for_set_size(
-    tuning_curves: np.ndarray,
-    set_size: int,
-    gamma: float,
-    N: int
-) -> np.ndarray:
+# =============================================================================
+# SET SIZE EXPERIMENT
+# =============================================================================
+
+def run_set_size_experiment(
+    population: List[Dict],
+    theta_values: np.ndarray,
+    cfg: Exp4Config,
+    rng: np.random.RandomState
+) -> Dict:
     """
-    Scale tuning curves to reflect per-item activity under DN.
+    Run decoding experiment across multiple set sizes.
     
-    Under DN with l items, total activity = γN, so per-item = γN/l.
-    This scales the tuning curves accordingly.
+    For each set size ℓ:
+    - Select ℓ random active locations
+    - Generate random true orientations
+    - Run n_trials decoding trials
+    - Collect error statistics
+    
+    Returns
+    -------
+    results : Dict with errors, statistics per set size
+    """
+    results = {l: {'errors': [], 'theta_true': [], 'theta_est': []} 
+               for l in cfg.set_sizes}
+    
+    for l in tqdm(cfg.set_sizes, desc="Set sizes"):
+        for trial in range(cfg.n_trials):
+            # Sample active locations
+            active_locations = tuple(rng.choice(
+                cfg.n_locations, size=l, replace=False
+            ))
+            
+            # Sample true orientations (uniform on circle)
+            true_orientations = rng.uniform(-np.pi, np.pi, size=l)
+            
+            # Cued location (always first in active set for simplicity)
+            cued_index = 0
+            
+            # Run trial
+            trial_result = run_single_trial_multi_item(
+                population, theta_values, cfg,
+                active_locations, true_orientations,
+                cued_index, rng
+            )
+            
+            results[l]['errors'].append(trial_result['error'])
+            results[l]['theta_true'].append(trial_result['theta_true'])
+            results[l]['theta_est'].append(trial_result['theta_estimate'])
+        
+        # Convert to arrays
+        results[l]['errors'] = np.array(results[l]['errors'])
+        results[l]['theta_true'] = np.array(results[l]['theta_true'])
+        results[l]['theta_est'] = np.array(results[l]['theta_est'])
+        
+        # Compute statistics
+        results[l]['circular_std'] = compute_circular_std(results[l]['errors'])
+        results[l]['circular_std_deg'] = np.degrees(results[l]['circular_std'])
+        results[l]['mean_abs_error'] = np.mean(np.abs(results[l]['errors']))
+        results[l]['mean_abs_error_deg'] = np.degrees(results[l]['mean_abs_error'])
+    
+    return results
+
+
+# =============================================================================
+# SINGLE-ITEM BASELINE (for comparison)
+# =============================================================================
+
+def run_single_item_baseline(
+    population: List[Dict],
+    theta_values: np.ndarray,
+    cfg: Exp4Config,
+    rng: np.random.RandomState
+) -> Dict:
+    """
+    Run single-item decoding baseline (no marginalisation needed).
+    
+    This uses the standard single-location decoder for comparison.
+    """
+    N = len(population)
+    results = {l: {'errors': []} for l in cfg.set_sizes}
+    
+    for l in tqdm(cfg.set_sizes, desc="Single-item baseline"):
+        # For single-item, we use location 0's tuning curves
+        # and scale by 1/ℓ to simulate DN effect
+        tuning_curves = np.zeros((N, cfg.n_orientations))
+        for i, neuron in enumerate(population):
+            f = neuron['f_samples'][0, :]
+            tuning_curves[i, :] = np.exp(f)
+        
+        # Apply DN and scale for set size
+        pop_mean = np.mean(tuning_curves, axis=0, keepdims=True)
+        tuning_curves = cfg.gamma * tuning_curves / (cfg.sigma_sq + pop_mean)
+        tuning_curves = tuning_curves / l  # DN scaling for ℓ items
+        
+        for trial in range(cfg.n_trials):
+            # Sample true orientation
+            theta_true = rng.uniform(-np.pi, np.pi)
+            theta_idx = np.argmin(np.abs(theta_values - theta_true))
+            
+            # Get rates and generate spikes
+            rates = tuning_curves[:, theta_idx]
+            spike_counts = generate_spikes(rates, cfg.T_d, rng)
+            
+            # Decode
+            theta_ml, _, _ = decode_ml(spike_counts, tuning_curves, theta_values, cfg.T_d)
+            error = compute_circular_error(theta_true, theta_ml)
+            results[l]['errors'].append(error)
+        
+        results[l]['errors'] = np.array(results[l]['errors'])
+        results[l]['circular_std_deg'] = np.degrees(
+            compute_circular_std(results[l]['errors'])
+        )
+    
+    return results
+
+
+# =============================================================================
+# FISHER INFORMATION ANALYSIS
+# =============================================================================
+
+def compute_theoretical_bounds(
+    population: List[Dict],
+    theta_values: np.ndarray,
+    cfg: Exp4Config
+) -> Dict:
+    """Compute Fisher Information and Cramér-Rao bounds for each set size."""
+    N = len(population)
+    
+    # Build base tuning curves (location 0)
+    base_tuning = np.zeros((N, cfg.n_orientations))
+    for i, neuron in enumerate(population):
+        f = neuron['f_samples'][0, :]
+        base_tuning[i, :] = np.exp(f)
+    
+    # Apply DN
+    pop_mean = np.mean(base_tuning, axis=0, keepdims=True)
+    base_tuning = cfg.gamma * base_tuning / (cfg.sigma_sq + pop_mean)
+    
+    # Compute derivatives
+    derivatives = compute_tuning_curve_derivative(base_tuning, theta_values)
+    
+    results = {'set_sizes': [], 'fisher_info': [], 'cr_std_deg': []}
+    
+    for l in cfg.set_sizes:
+        scaled_tuning = base_tuning / l
+        scaled_deriv = derivatives / l
+        
+        theta_idx = cfg.n_orientations // 2
+        I_F = compute_fisher_information(scaled_tuning, scaled_deriv, theta_idx, cfg.T_d)
+        cr_var = compute_cramer_rao_bound(I_F)
+        
+        results['set_sizes'].append(l)
+        results['fisher_info'].append(I_F)
+        results['cr_std_deg'].append(np.degrees(np.sqrt(cr_var)))
+    
+    return results
+
+
+# =============================================================================
+# MAIN EXPERIMENT RUNNER
+# =============================================================================
+
+def run_experiment_4(config: Dict) -> Dict:
+    """
+    Run Experiment 4: Multi-Item ML Decoding.
     
     Parameters
     ----------
-    tuning_curves : np.ndarray
-        Base tuning curves (for set size 1), shape (N, n_theta)
-    set_size : int
-        Number of items in memory
-    gamma : float
-        Gain constant
-    N : int
-        Number of neurons
+    config : Dict
+        Configuration from run_experiments.py
         
     Returns
     -------
-    scaled_curves : np.ndarray
-        Tuning curves scaled for set size
+    results : Dict
     """
-    # Total activity budget per item
-    scaling_factor = 1.0 / set_size
+    cfg = Exp4Config(
+        n_neurons=config.get('n_neurons', 100),
+        n_orientations=config.get('n_orientations', 32),
+        n_locations=config.get('n_locations', 8),
+        gamma=config.get('gamma', 100.0),
+        sigma_sq=config.get('sigma_sq', 1e-6),
+        T_d=config.get('T_d', 0.1),
+        n_trials=config.get('n_trials', 500),
+        set_sizes=tuple(config.get('set_sizes', [1, 2, 4])),
+        seed=config.get('seed', 42),
+    )
     
-    return tuning_curves * scaling_factor
+    print("=" * 70)
+    print("EXPERIMENT 4: MULTI-ITEM ML DECODING WITH MARGINALISATION")
+    print("=" * 70)
+    print(f"\nConfiguration:")
+    print(f"  N = {cfg.n_neurons} neurons")
+    print(f"  n_θ = {cfg.n_orientations} orientation bins")
+    print(f"  L = {cfg.n_locations} total locations")
+    print(f"  γ = {cfg.gamma} Hz/neuron → Total = {cfg.total_activity} Hz")
+    print(f"  T_d = {cfg.T_d} s")
+    print(f"  Trials = {cfg.n_trials}")
+    print(f"  Set sizes = {cfg.set_sizes}")
+    print()
+    
+    rng = np.random.RandomState(cfg.seed)
+    
+    # Setup population
+    print("Generating GP population with mixed selectivity...")
+    population, theta_values = setup_population(cfg)
+    print(f"  Generated {len(population)} neurons")
+    
+    # Run multi-item decoding
+    print("\nRunning multi-item decoding with marginalisation...")
+    multi_item_results = run_set_size_experiment(population, theta_values, cfg, rng)
+    
+    # Run single-item baseline
+    print("\nRunning single-item baseline...")
+    single_item_results = run_single_item_baseline(population, theta_values, cfg, rng)
+    
+    # Compute theoretical bounds
+    print("\nComputing Fisher Information bounds...")
+    theoretical = compute_theoretical_bounds(population, theta_values, cfg)
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("RESULTS SUMMARY")
+    print("=" * 70)
+    print(f"\n{'Set Size':<10} {'Multi-Item σ (°)':<18} {'Single-Item σ (°)':<18} {'CR Bound (°)':<15}")
+    print("-" * 60)
+    for i, l in enumerate(cfg.set_sizes):
+        mi_std = multi_item_results[l]['circular_std_deg']
+        si_std = single_item_results[l]['circular_std_deg']
+        cr_std = theoretical['cr_std_deg'][i]
+        print(f"{l:<10} {mi_std:<18.2f} {si_std:<18.2f} {cr_std:<15.2f}")
+    
+    # Check √ℓ scaling
+    stds = [multi_item_results[l]['circular_std_deg'] for l in cfg.set_sizes]
+    normalised = [stds[i] / np.sqrt(l) for i, l in enumerate(cfg.set_sizes)]
+    cv = np.std(normalised) / np.mean(normalised)
+    print(f"\n√ℓ Scaling Check:")
+    print(f"  Normalised stds: {[f'{n:.2f}' for n in normalised]}")
+    print(f"  CV of normalised: {cv:.3f} (< 0.1 is good)")
+    
+    return {
+        'config': config,
+        'exp_config': cfg,
+        'theta_values': theta_values,
+        'multi_item': multi_item_results,
+        'single_item': single_item_results,
+        'theoretical': theoretical,
+        'scaling': {
+            'empirical_std': stds,
+            'normalised_by_sqrt_l': normalised,
+            'cv_normalised': cv,
+        }
+    }
+
+
+# =============================================================================
+# PLOTTING
+# =============================================================================
+
+def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
+    """Generate figures for Experiment 4."""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
+    palette = sns.color_palette("deep")
+    
+    cfg = results['exp_config']
+    multi_item = results['multi_item']
+    single_item = results['single_item']
+    theoretical = results['theoretical']
+    set_sizes = list(cfg.set_sizes)
+    
+    mi_std = [multi_item[l]['circular_std_deg'] for l in set_sizes]
+    si_std = [single_item[l]['circular_std_deg'] for l in set_sizes]
+    cr_std = theoretical['cr_std_deg']
+    
+    # Figure 1: Error Scaling Comparison
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    ax = axes[0]
+    ax.plot(set_sizes, mi_std, 'o-', color=palette[0], lw=2.5, ms=10, 
+            label='Multi-item (marginalised)')
+    ax.plot(set_sizes, si_std, 's--', color=palette[1], lw=2, ms=8, 
+            label='Single-item baseline')
+    ax.plot(set_sizes, cr_std, '^:', color=palette[2], lw=2, ms=8, 
+            label='Cramér-Rao bound')
+    
+    ref = [mi_std[0] * np.sqrt(l / set_sizes[0]) for l in set_sizes]
+    ax.plot(set_sizes, ref, ':', color='gray', lw=2, alpha=0.7, label='∝ √ℓ')
+    
+    ax.set_xlabel('Set Size (ℓ)')
+    ax.set_ylabel('Circular Std (degrees)')
+    ax.set_title('A. Decoding Error vs Set Size')
+    ax.legend()
+    ax.set_xticks(set_sizes)
+    sns.despine(ax=ax)
+    
+    ax = axes[1]
+    normalised = results['scaling']['normalised_by_sqrt_l']
+    ax.plot(set_sizes, normalised, 'o-', color=palette[3], lw=2.5, ms=10)
+    ax.axhline(np.mean(normalised), color='red', ls='--', lw=2,
+               label=f'Mean = {np.mean(normalised):.2f}°')
+    ax.set_xlabel('Set Size (ℓ)')
+    ax.set_ylabel('Error Std / √ℓ (degrees)')
+    ax.set_title(f'B. √ℓ Scaling (CV = {results["scaling"]["cv_normalised"]:.3f})')
+    ax.legend()
+    ax.set_xticks(set_sizes)
+    sns.despine(ax=ax)
+    
+    plt.suptitle('Experiment 4: Multi-Item ML Decoding with Marginalisation',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_path / 'exp4_error_scaling.png', dpi=150, bbox_inches='tight')
+    if show_plot:
+        plt.show()
+    plt.close()
+    print(f"  ✓ Saved: exp4_error_scaling.png")
+    
+    # Figure 2: Error Distributions
+    n_sizes = len(set_sizes)
+    fig, axes = plt.subplots(1, n_sizes, figsize=(4*n_sizes, 4))
+    colors = sns.color_palette("coolwarm", n_sizes)
+    
+    for i, l in enumerate(set_sizes):
+        ax = axes[i] if n_sizes > 1 else axes
+        errors = np.degrees(multi_item[l]['errors'])
+        
+        sns.histplot(errors, kde=True, ax=ax, color=colors[i],
+                     stat='density', alpha=0.6, bins=30)
+        
+        std = multi_item[l]['circular_std_deg']
+        ax.set_xlabel('Error (degrees)')
+        ax.set_ylabel('Density' if i == 0 else '')
+        ax.set_title(f'ℓ = {l}\nσ = {std:.1f}°')
+        ax.set_xlim([-90, 90])
+    
+    plt.suptitle('Error Distributions (Multi-Item Decoder)',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(output_path / 'exp4_error_distributions.png', dpi=150, bbox_inches='tight')
+    if show_plot:
+        plt.show()
+    plt.close()
+    print(f"  ✓ Saved: exp4_error_distributions.png")
+
+
+# =============================================================================
+# STANDALONE ENTRY
+# =============================================================================
+
+if __name__ == '__main__':
+    config = {
+        'n_neurons': 100,
+        'n_orientations': 32,
+        'n_locations': 8,
+        'gamma': 100.0,
+        'sigma_sq': 1e-6,
+        'T_d': 0.1,
+        'n_trials': 200,
+        'seed': 42,
+        'set_sizes': [1, 2, 4],
+    }
+    
+    results = run_experiment_4(config)
+    plot_results(results, 'results/exp4', show_plot=True)
