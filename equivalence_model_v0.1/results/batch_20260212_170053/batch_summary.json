@@ -1,0 +1,70 @@
+{
+  "timestamp": "20260212_170053",
+  "total_runs": 4,
+  "successful": 4,
+  "failed": 0,
+  "total_time_seconds": 146.90955519676208,
+  "config": {
+    "n_orientations": 10,
+    "n_locations": 8,
+    "set_sizes": [
+      2,
+      4,
+      6,
+      8
+    ],
+    "gamma": 100.0,
+    "sigma_sq": 1e-06,
+    "lambda_base": 0.3,
+    "sigma_lambda": 0.5,
+    "T_d": 0.1,
+    "n_trials": 500,
+    "kappa": 2.0
+  },
+  "experiments": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "neurons_list": [
+    100
+  ],
+  "seeds_list": [
+    42
+  ],
+  "results": [
+    {
+      "status": "success",
+      "experiment": 1,
+      "n_neurons": 100,
+      "seed": 42,
+      "elapsed_seconds": 137.62231588363647,
+      "output_dir": "results/batch_20260212_170053/exp1_seed42_20260212_170053/N100"
+    },
+    {
+      "status": "success",
+      "experiment": 2,
+      "n_neurons": 100,
+      "seed": 42,
+      "elapsed_seconds": 0.48032188415527344,
+      "output_dir": "results/batch_20260212_170053/exp2_seed42_20260212_170311/N100"
+    },
+    {
+      "status": "success",
+      "experiment": 3,
+      "n_neurons": 100,
+      "seed": 42,
+      "elapsed_seconds": 0.8328001499176025,
+      "output_dir": "results/batch_20260212_170053/exp3_seed42_20260212_170311/N100"
+    },
+    {
+      "status": "success",
+      "experiment": 4,
+      "n_neurons": 100,
+      "seed": 42,
+      "elapsed_seconds": 7.973459005355835,
+      "output_dir": "results/batch_20260212_170053/exp4_seed42_20260212_170312/N100"
+    }
+  ]
+}
