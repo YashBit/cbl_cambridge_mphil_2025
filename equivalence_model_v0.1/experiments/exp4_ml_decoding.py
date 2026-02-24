@@ -121,8 +121,14 @@ def run_single_trial_efficient(
 
     f_samples_list = extract_f_samples_for_locations(population, active_locations)
 
-    # True orientation → nearest grid index
-    theta_indices = [np.argmin(np.abs(theta_values - t)) for t in true_orientations]
+    # True orientation → nearest grid index (circular distance!)
+    def _nearest_on_circle(theta_val, grid):
+        """Snap a continuous angle to the nearest grid point using circular distance."""
+        diff = np.abs(grid - theta_val)
+        circ_diff = np.minimum(diff, 2 * np.pi - diff)
+        return int(np.argmin(circ_diff))
+
+    theta_indices = [_nearest_on_circle(t, theta_values) for t in true_orientations]
 
     # Pre-normalised rate (product over active locations in log space)
     log_r_pre = np.zeros(N)
@@ -230,7 +236,8 @@ def _run_part_a(population, theta_values, cfg, rng, verbose=True):
         scaled = base_tuning_dn / l
         for _ in range(cfg.n_trials):
             theta_true = rng.uniform(0, 2 * np.pi)
-            theta_idx = np.argmin(np.abs(theta_values - theta_true))
+            _diff = np.abs(theta_values - theta_true)
+            theta_idx = np.argmin(np.minimum(_diff, 2 * np.pi - _diff))
             rates = scaled[:, theta_idx]
             spikes = generate_spikes(rates, cfg.T_d, rng)
             theta_ml, _, _ = decode_ml(spikes, scaled, theta_values, cfg.T_d)
@@ -403,6 +410,113 @@ def _run_part_c(cfg, rng, verbose=True):
 
 
 # =============================================================================
+# PART D — PRECISION COMPARISON: broad (λ=3) vs sharp (λ=1)
+# =============================================================================
+
+PART_D_T_D = 2.0          # 200 spk/neuron at γ=100
+PART_D_LAMBDA_BROAD = 3.0  # broad tuning — gentle bumps
+PART_D_LAMBDA_SHARP = 1.0  # sharp tuning — well-resolved peaks
+
+
+def _run_part_d(cfg, rng, verbose=True):
+    """Compare decoding error for broad vs sharp tuning at high SNR.
+
+    λ=3.0 → tuning width ~170°, nearly flat response across orientations.
+    λ=1.0 → tuning width ~57°, clear peaked selectivity.
+
+    Both values are well above the grid spacing (2π/n_θ ≈ 0.20 rad for
+    n_θ=32), ensuring the GP samples are properly resolved.
+
+    Uses T_d=2.0 s (200 spk/neuron at γ=100) so the ML estimator
+    operates efficiently and √l scaling is cleanly visible.
+    """
+    lambda_broad = PART_D_LAMBDA_BROAD
+    lambda_sharp = PART_D_LAMBDA_SHARP
+    T_d = PART_D_T_D
+
+    conditions = {
+        'broad': lambda_broad,
+        'sharp': lambda_sharp,
+    }
+
+    if verbose:
+        print(f"\n  {'─'*60}")
+        print(f"  PART D: PRECISION COMPARISON  (high-SNR regime)")
+        print(f"  {'─'*60}")
+        print(f"    λ_broad={lambda_broad:.1f}  λ_sharp={lambda_sharp:.1f}")
+        print(f"    T_d={T_d}s  (~{cfg.gamma * T_d:.0f} spk/neuron)  "
+              f"n_trials={cfg.n_trials}")
+
+    condition_results = {}
+
+    for label, lam in conditions.items():
+        if verbose:
+            print(f"\n    --- {label}: λ_base = {lam:.2f} ---")
+
+        pop = generate_neuron_population(
+            n_neurons=cfg.n_neurons,
+            n_orientations=cfg.n_orientations,
+            n_locations=cfg.n_locations,
+            base_lengthscale=lam,
+            lengthscale_variability=0.0,   # pure base, no jitter
+            seed=cfg.seed,
+        )
+        theta_vals = pop[0]['orientations']
+
+        cond_cfg = Exp4Config(
+            n_neurons=cfg.n_neurons,
+            n_orientations=cfg.n_orientations,
+            n_locations=cfg.n_locations,
+            gamma=cfg.gamma,
+            sigma_sq=cfg.sigma_sq,
+            T_d=T_d,
+            n_trials=cfg.n_trials,
+            set_sizes=cfg.set_sizes,
+            lambda_base=lam,
+            sigma_lambda=0.0,
+            seed=cfg.seed,
+        )
+
+        # Same RNG seed for both conditions → identical trial configs
+        cond_rng = np.random.RandomState(cfg.seed + 2)
+        res = _run_decoding_loop(
+            pop, theta_vals, cond_cfg, cond_rng,
+            cfg.n_trials, cfg.set_sizes,
+            desc_prefix=f"D {label:<9s}"
+        )
+
+        stds_deg = [res[l]['circular_std_deg'] for l in cfg.set_sizes]
+        condition_results[label] = {
+            'lambda_base': lam,
+            'stds_deg': stds_deg,
+            'per_set_size': res,
+        }
+
+        if verbose:
+            tag = "  ".join(
+                f"l={l}: {stds_deg[i]:.1f}°"
+                for i, l in enumerate(cfg.set_sizes)
+            )
+            print(f"      {tag}")
+
+    if verbose:
+        print(f"\n    Δ error (broad − sharp):")
+        for i, l in enumerate(cfg.set_sizes):
+            broad = condition_results['broad']['stds_deg'][i]
+            sharp = condition_results['sharp']['stds_deg'][i]
+            print(f"      l={l}: {broad:.1f}° → {sharp:.1f}°  "
+                  f"(Δ = {broad - sharp:+.1f}°, "
+                  f"{100*(broad - sharp)/broad:+.1f}%)")
+
+    return {
+        'condition_results': condition_results,
+        'lambda_broad': lambda_broad,
+        'lambda_sharp': lambda_sharp,
+        'T_d': T_d,
+    }
+
+
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -447,6 +561,7 @@ def run_experiment_4(config: Dict) -> Dict:
     part_a = _run_part_a(population, theta_values, cfg, rng)
     part_b = _run_part_b(cfg, rng)
     part_c = _run_part_c(cfg, rng)
+    part_d = _run_part_d(cfg, rng)
 
     print(f"\n{'='*70}")
     print("EXPERIMENT 4 COMPLETE")
@@ -464,6 +579,8 @@ def run_experiment_4(config: Dict) -> Dict:
         'bias': part_b,
         # Part C
         'lengthscale_sweep': part_c,
+        # Part D
+        'precision_comparison': part_d,
         'method': 'efficient_factorized',
     }
 
@@ -651,6 +768,150 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
         plt.show()
     plt.close()
     print(f"  Saved: exp4c_lengthscale_sweep.png")
+
+    # ================================================================
+    # PLOT 5: Part D — Precision comparison: broad vs sharp (2 panels)
+    # ================================================================
+    if 'precision_comparison' in results:
+        pc = results['precision_comparison']
+        cond_res = pc['condition_results']
+        lam_broad = pc['lambda_broad']
+        lam_sharp = pc['lambda_sharp']
+        T_d_used = pc['T_d']
+        spk = cfg.gamma * T_d_used
+
+        broad_stds = cond_res['broad']['stds_deg']
+        sharp_stds = cond_res['sharp']['stds_deg']
+
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True)
+
+        # √l references anchored at l=2
+        ref_broad = [broad_stds[0] * np.sqrt(l / set_sizes[0])
+                     for l in set_sizes]
+        ref_sharp = [sharp_stds[0] * np.sqrt(l / set_sizes[0])
+                     for l in set_sizes]
+
+        # --- Panel A: Broad tuning ---
+        ax = axes[0]
+        ax.plot(set_sizes, broad_stds, 'o-', color=palette[0],
+                lw=2.5, ms=10, label='Decoder error', zorder=5)
+        ax.plot(set_sizes, ref_broad, ':', color=palette[0],
+                lw=1.8, alpha=0.5, label=r'$\propto \sqrt{\ell}$ ref')
+        for i, l in enumerate(set_sizes):
+            ax.annotate(f'{broad_stds[i]:.1f}°',
+                        (l, broad_stds[i]),
+                        textcoords='offset points', xytext=(10, -5),
+                        fontsize=10, fontweight='bold', color=palette[0])
+        ax.set_xlabel(r'Set Size ($\ell$)', fontsize=13)
+        ax.set_ylabel('Circular Std (degrees)', fontsize=13)
+        ax.set_title(f'A.  Broad tuning  (λ = {lam_broad:.1f})',
+                     fontsize=12, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.set_xticks(set_sizes)
+        sns.despine(ax=ax)
+
+        # --- Panel B: Sharp tuning ---
+        ax = axes[1]
+        ax.plot(set_sizes, sharp_stds, 's-', color=palette[3],
+                lw=2.5, ms=10, label='Decoder error', zorder=5)
+        ax.plot(set_sizes, ref_sharp, ':', color=palette[3],
+                lw=1.8, alpha=0.5, label=r'$\propto \sqrt{\ell}$ ref')
+        for i, l in enumerate(set_sizes):
+            ax.annotate(f'{sharp_stds[i]:.1f}°',
+                        (l, sharp_stds[i]),
+                        textcoords='offset points', xytext=(10, -5),
+                        fontsize=10, fontweight='bold', color=palette[3])
+        ax.set_xlabel(r'Set Size ($\ell$)', fontsize=13)
+        ax.set_title(f'B.  Sharp tuning  (λ = {lam_sharp:.1f})',
+                     fontsize=12, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.set_xticks(set_sizes)
+        sns.despine(ax=ax)
+
+        plt.suptitle(
+            f'Experiment 4D: Decoding Precision  —  '
+            f'T_d = {T_d_used}s  ({spk:.0f} spk/neuron)',
+            fontsize=14, fontweight='bold'
+        )
+        plt.tight_layout()
+        plt.savefig(out / 'exp4d_precision_comparison.png',
+                    dpi=150, bbox_inches='tight')
+        if show_plot:
+            plt.show()
+        plt.close()
+        print(f"  Saved: exp4d_precision_comparison.png")
+
+        # ============================================================
+        # PLOT 6: Part D — Bias comparison: broad vs sharp (2 panels)
+        # ============================================================
+        broad_bias = [cond_res['broad']['per_set_size'][l]['mean_error_deg']
+                      for l in set_sizes]
+        sharp_bias = [cond_res['sharp']['per_set_size'][l]['mean_error_deg']
+                      for l in set_sizes]
+
+        # 95% CI from stored errors
+        broad_ci = [1.96 * np.degrees(np.std(
+                        cond_res['broad']['per_set_size'][l]['errors']))
+                    / np.sqrt(len(cond_res['broad']['per_set_size'][l]['errors']))
+                    for l in set_sizes]
+        sharp_ci = [1.96 * np.degrees(np.std(
+                        cond_res['sharp']['per_set_size'][l]['errors']))
+                    / np.sqrt(len(cond_res['sharp']['per_set_size'][l]['errors']))
+                    for l in set_sizes]
+
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True)
+
+        # --- Panel A: Broad tuning bias ---
+        ax = axes[0]
+        ax.bar(set_sizes, broad_bias, width=0.6, color=palette[0],
+               alpha=0.7, edgecolor='black', linewidth=0.8)
+        ax.errorbar(set_sizes, broad_bias, yerr=broad_ci, fmt='none',
+                    color='black', capsize=6, capthick=1.5, lw=1.5)
+        ax.axhline(0, color='red', ls='--', lw=1.5)
+        for i, l in enumerate(set_sizes):
+            ax.annotate(f'{broad_bias[i]:+.1f}°',
+                        (l, broad_bias[i]),
+                        textcoords='offset points',
+                        xytext=(0, 8 if broad_bias[i] >= 0 else -14),
+                        ha='center', fontsize=10, fontweight='bold')
+        ax.set_xlabel(r'Set Size ($\ell$)', fontsize=13)
+        ax.set_ylabel('Mean Signed Error (degrees)', fontsize=13)
+        ax.set_title(f'A.  Broad tuning bias  (λ = {lam_broad:.1f})',
+                     fontsize=12, fontweight='bold')
+        ax.set_xticks(set_sizes)
+        sns.despine(ax=ax)
+
+        # --- Panel B: Sharp tuning bias ---
+        ax = axes[1]
+        ax.bar(set_sizes, sharp_bias, width=0.6, color=palette[3],
+               alpha=0.7, edgecolor='black', linewidth=0.8)
+        ax.errorbar(set_sizes, sharp_bias, yerr=sharp_ci, fmt='none',
+                    color='black', capsize=6, capthick=1.5, lw=1.5)
+        ax.axhline(0, color='red', ls='--', lw=1.5)
+        for i, l in enumerate(set_sizes):
+            ax.annotate(f'{sharp_bias[i]:+.1f}°',
+                        (l, sharp_bias[i]),
+                        textcoords='offset points',
+                        xytext=(0, 8 if sharp_bias[i] >= 0 else -14),
+                        ha='center', fontsize=10, fontweight='bold')
+        ax.set_xlabel(r'Set Size ($\ell$)', fontsize=13)
+        ax.set_title(f'B.  Sharp tuning bias  (λ = {lam_sharp:.1f})',
+                     fontsize=12, fontweight='bold')
+        ax.set_xticks(set_sizes)
+        sns.despine(ax=ax)
+
+        plt.suptitle(
+            f'Experiment 4D: Decoder Bias  —  '
+            f'T_d = {T_d_used}s  ({spk:.0f} spk/neuron)',
+            fontsize=14, fontweight='bold'
+        )
+        plt.tight_layout()
+        plt.savefig(out / 'exp4d_bias_comparison.png',
+                    dpi=150, bbox_inches='tight')
+        if show_plot:
+            plt.show()
+        plt.close()
+        print(f"  Saved: exp4d_bias_comparison.png")
 
 
 # =============================================================================

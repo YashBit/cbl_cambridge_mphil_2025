@@ -5,7 +5,7 @@ Experiment 1: Pre-Normalized Response Analysis
 WHAT THIS EXPERIMENT DOES
 =============================================================================
 
-A single call to run_experiment_1(config) runs TWO complementary analyses:
+A single call to run_experiment_1(config) runs THREE complementary analyses:
 
 Part A — EXHAUSTIVE ENUMERATION:
     - Enumerates ALL C(L, l) subsets for each set size
@@ -19,19 +19,30 @@ Part B — RANDOM (S, theta) SAMPLING:
     - Demonstrates that R scales with l regardless of specific (S, theta)
     - Foundation for Activity Cap Theorem simplification in
       Marginalised Log-Likelihood
+    - NEW: Shows D(S,theta) = mean-over-neurons for each stimulus
+      to test whether D concentrates (small scatter => Activity Cap holds)
+
+Part C — LENGTHSCALE COMPARISON (broad λ=3 vs sharp λ=1):
+    - Generates populations at two lengthscales (σ_λ=0, same seed)
+    - Runs Part B sampling on each to compute D(S,θ) concentration
+    - Shows how tuning sharpness affects the pre-DN response statistics
+      that feed into the decoder (mirrors Exp4 Part D structure)
 
 =============================================================================
-PLOTS PRODUCED (5 total)
+PLOTS PRODUCED (8 total)
 =============================================================================
 
 1. R.mean vs Set Size (exhaustive, log scale)
 2. Per-Item Activity vs Set Size (exhaustive)
 3. Separability Distribution (if N > 1)
-4. Dot-Band (random sampling)
-5. Exponential Scaling + Normalised Spread (random)
+4. Dot-Band — per-NEURON avg (random sampling, original)
+5. Exponential Scaling + Normalised Spread — per-neuron (random)
+6. Dot-Band — D(S,theta) per-STIMULUS avg (random sampling, NEW)
+7. D(S,theta) Scaling + Normalised Spread — per-stimulus (NEW)
+8. Lengthscale Comparison — D(S,θ) CV for broad vs sharp tuning (Part C)
 
 Author: Mixed Selectivity Project
-Date: December 2025 (Part A), January 2026 (Part B)
+Date: December 2025 (Part A), January 2026 (Part B), February 2026 (Parts B D-view, C)
 """
 
 import numpy as np
@@ -203,40 +214,100 @@ def sample_random_subsets(n_locations, l, n_subsets, rng):
 
 
 def _run_part_b(population, G_stacked, cfg, verbose=True):
-    """Part B: Random (S, theta) sampling of pre-normalized responses."""
+    """
+    Part B: Random (S, theta) sampling of pre-normalized responses.
+
+    Computes BOTH views of the data:
+      1. per_neuron_avg: for each neuron, average over all (S,theta) draws
+         -> N dots per set size (one per neuron).  Shows across-neuron variability.
+      2. D_stimulus_avg: for each (S,theta), average over all neurons
+         -> n_unique dots per set size (one per stimulus).  Shows across-stimulus
+         variability of D(S,theta).  Tests whether D concentrates — the foundation
+         for the Activity Cap Theorem.
+
+    ADAPTIVE SAMPLING (Feb 2026):
+        The number of unique (S,theta) stimuli is held approximately constant
+        across set sizes by scaling theta draws inversely with C(L,l).
+        At l=8 with L=8 there is only 1 possible subset, so ALL variation
+        comes from theta; at l=2 there are 28 subsets contributing diversity.
+        We target `n_unique_target` unique stimuli at every l so that the
+        scatter at l=8 is just as statistically trustworthy as at l=2.
+    """
+    from math import comb
+
     set_sizes = cfg['set_sizes']
     N = cfg['n_neurons']
-    n_subsets = cfg.get('n_random_subsets', 50)
-    n_theta_draws = cfg.get('n_theta_draws', 5)
+    L = cfg['n_locations']
+    n_unique_target = cfg.get('n_unique_target', 250)
 
     if verbose:
         print(f"\n  {'─'*60}")
-        print(f"  PART B: RANDOM (S, theta) SAMPLING")
+        print(f"  PART B: RANDOM (S, theta) SAMPLING — ADAPTIVE")
         print(f"  {'─'*60}")
-        print(f"    Subsets/set size:  {n_subsets}")
-        print(f"    theta draws:      {n_theta_draws}")
-        print(f"    Total samples:    {n_subsets * n_theta_draws}")
+        print(f"    Target unique stimuli per l:  {n_unique_target}")
 
     rng = np.random.default_rng(cfg['seed'] + 2000)
     per_neuron_avg = {}
     per_neuron_all = {}
+    D_stimulus_avg = {}
+    D_stimulus_all = {}
+    sampling_info = {}        # track how many subsets/thetas per l
 
     for l in set_sizes:
+        n_possible_subsets = comb(L, l)
+
+        # ── Adaptive: decide how many subsets and theta draws ──
+        # Use all subsets if feasible (≤ n_unique_target), else cap
+        n_sub = min(n_possible_subsets, n_unique_target)
+        # Scale theta draws so that n_sub * n_theta ≈ n_unique_target
+        n_theta = max(1, int(np.ceil(n_unique_target / n_sub)))
+        n_actual = n_sub * n_theta
+
+        use_exhaustive_subsets = (n_possible_subsets <= n_unique_target)
+
+        if verbose:
+            print(f"    l={l}:  C({L},{l})={n_possible_subsets:>4}  |  "
+                  f"subsets={n_sub:>4} ({'all' if use_exhaustive_subsets else 'sampled'})  x  "
+                  f"θ-draws={n_theta:>4}  =  {n_actual:>5} unique stimuli")
+
+        # ── Generate subsets ──
+        if use_exhaustive_subsets:
+            subsets = list(combinations(range(L), l))
+        else:
+            subsets = sample_random_subsets(L, l, n_sub, rng)
+
+        # ── Sample responses ──
         all_responses = []
-        for t in range(n_theta_draws):
-            theta_indices = rng.integers(0, cfg['n_orientations'], size=cfg['n_locations'])
-            subsets = sample_random_subsets(cfg['n_locations'], l, n_subsets, rng)
+        for t in range(n_theta):
+            theta_indices = rng.integers(0, cfg['n_orientations'], size=L)
             for subset in subsets:
                 all_responses.append(compute_neuron_pre_dn(G_stacked, subset, theta_indices))
-        all_responses = np.stack(all_responses, axis=0)
-        neuron_avg = np.mean(all_responses, axis=0)
-        per_neuron_avg[l] = neuron_avg
-        per_neuron_all[l] = all_responses.T
-        if verbose:
-            print(f"    l={l}: {all_responses.shape[0]} samples | "
-                  f"median = {np.median(neuron_avg):.4f} | "
-                  f"IQR = [{np.percentile(neuron_avg, 25):.4f}, {np.percentile(neuron_avg, 75):.4f}]")
 
+        all_responses = np.stack(all_responses, axis=0)   # (n_actual, N)
+
+        # --- Original: average over stimuli -> one value per neuron ---
+        neuron_avg = np.mean(all_responses, axis=0)        # (N,)
+        per_neuron_avg[l] = neuron_avg
+        per_neuron_all[l] = all_responses.T                # (N, n_actual)
+
+        # --- D(S,theta): average over neurons -> one value per stimulus ---
+        stimulus_avg = np.mean(all_responses, axis=1)      # (n_actual,)
+        D_stimulus_avg[l] = stimulus_avg
+        D_stimulus_all[l] = all_responses                  # (n_actual, N)
+
+        sampling_info[l] = {
+            'n_possible_subsets': n_possible_subsets,
+            'n_subsets_used': n_sub,
+            'n_theta_draws': n_theta,
+            'n_actual': n_actual,
+            'exhaustive_subsets': use_exhaustive_subsets,
+        }
+
+        if verbose:
+            print(f"           D(S,θ) median = {np.median(stimulus_avg):.4f}  "
+                  f"CV = {np.std(stimulus_avg)/(np.mean(stimulus_avg)+1e-30):.4f}")
+
+    # ── Summary statistics for per_neuron_avg (original, Plot 4) ──
     summary = {}
     for l in set_sizes:
         vals = per_neuron_avg[l]
@@ -249,15 +320,156 @@ def _run_part_b(population, G_stacked, cfg, verbose=True):
             'min': np.min(vals), 'max': np.max(vals),
         }
 
+    # ── Summary statistics for D_stimulus_avg (Plot 6) ──
+    D_summary = {}
+    for l in set_sizes:
+        vals = D_stimulus_avg[l]
+        q25, q75 = np.percentile(vals, [25, 75])
+        D_summary[l] = {
+            'mean': np.mean(vals), 'median': np.median(vals),
+            'std': np.std(vals), 'cv': np.std(vals) / (np.mean(vals) + 1e-30),
+            'iqr': q75 - q25, 'q25': q25, 'q75': q75,
+            'q05': np.percentile(vals, 5), 'q95': np.percentile(vals, 95),
+            'min': np.min(vals), 'max': np.max(vals),
+        }
+
     from scipy import stats as sp_stats
+
+    # Fit on per_neuron_avg medians (original)
     medians = np.array([summary[l]['median'] for l in set_sizes])
     slope, intercept, r_value, _, _ = sp_stats.linregress(set_sizes, np.log(medians + 1e-30))
     fit = {'g_bar': np.exp(slope), 'intercept': intercept, 'slope': slope, 'r_squared': r_value**2}
 
-    if verbose:
-        print(f"\n    Fit (median): R ~ {np.exp(intercept):.4f} x {np.exp(slope):.3f}^l  (R2={r_value**2:.6f})")
+    # Fit on D_stimulus_avg medians
+    D_medians = np.array([D_summary[l]['median'] for l in set_sizes])
+    D_slope, D_intercept, D_r_value, _, _ = sp_stats.linregress(set_sizes, np.log(D_medians + 1e-30))
+    D_fit = {'g_bar': np.exp(D_slope), 'intercept': D_intercept, 'slope': D_slope, 'r_squared': D_r_value**2}
 
-    return {'per_neuron_avg': per_neuron_avg, 'per_neuron_all': per_neuron_all, 'summary': summary, 'fit': fit}
+    if verbose:
+        print(f"\n    Fit (neuron-avg median): R ~ {np.exp(intercept):.4f} x {np.exp(slope):.3f}^l  (R2={r_value**2:.6f})")
+        print(f"    Fit (D(S,θ) median):    D ~ {np.exp(D_intercept):.4f} x {np.exp(D_slope):.3f}^l  (R2={D_r_value**2:.6f})")
+
+    return {
+        'per_neuron_avg': per_neuron_avg,
+        'per_neuron_all': per_neuron_all,
+        'summary': summary,
+        'fit': fit,
+        # D(S,theta) data
+        'D_stimulus_avg': D_stimulus_avg,
+        'D_stimulus_all': D_stimulus_all,
+        'D_summary': D_summary,
+        'D_fit': D_fit,
+        'sampling_info': sampling_info,
+    }
+
+
+# ============================================================================
+# PART C — LENGTHSCALE COMPARISON: D(S,θ) for broad vs sharp tuning
+# ============================================================================
+
+PART_C_LAMBDA_BROAD = 3.0
+PART_C_LAMBDA_SHARP = 1.0
+
+
+def _run_part_c(cfg, verbose=True):
+    """Compare D(S,θ) concentration for broad (λ=3) vs sharp (λ=1) tuning.
+
+    Mirrors the exp4 Part D structure: two populations that differ only in
+    base lengthscale, same seed, σ_λ=0.  Shows how tuning sharpness affects
+    the pre-DN response statistics that feed into the decoder.
+
+    For each condition, runs the same Part B random-sampling pipeline and
+    collects D(S,θ) = mean-over-neurons for each (S,θ) stimulus.
+    """
+    from math import comb
+
+    lambda_broad = PART_C_LAMBDA_BROAD
+    lambda_sharp = PART_C_LAMBDA_SHARP
+    set_sizes = cfg['set_sizes']
+    N = cfg['n_neurons']
+    L = cfg['n_locations']
+    n_unique_target = cfg.get('n_unique_target', 250)
+
+    conditions = {
+        'broad': lambda_broad,
+        'sharp': lambda_sharp,
+    }
+
+    if verbose:
+        print(f"\n  {'─'*60}")
+        print(f"  PART C: LENGTHSCALE COMPARISON  (D(S,θ) concentration)")
+        print(f"  {'─'*60}")
+        print(f"    λ_broad={lambda_broad:.1f}  λ_sharp={lambda_sharp:.1f}  σ_λ=0")
+
+    condition_results = {}
+
+    for label, lam in conditions.items():
+        if verbose:
+            print(f"\n    --- {label}: λ = {lam:.1f} ---")
+
+        pop = generate_neuron_population(
+            n_neurons=N,
+            n_orientations=cfg['n_orientations'],
+            n_locations=L,
+            base_lengthscale=lam,
+            lengthscale_variability=0.0,
+            seed=cfg['seed'],
+            gain_variability=cfg.get('gain_variability', 0.2),
+        )
+        G_stacked = np.stack([np.exp(neuron['f_samples']) for neuron in pop])
+
+        rng = np.random.default_rng(cfg['seed'] + 3000)
+
+        D_stimulus_avg = {}
+        D_summary = {}
+
+        for l in set_sizes:
+            n_possible = comb(L, l)
+            n_sub = min(n_possible, n_unique_target)
+            n_theta = max(1, int(np.ceil(n_unique_target / n_sub)))
+
+            if n_possible <= n_unique_target:
+                subsets = list(combinations(range(L), l))
+            else:
+                subsets = sample_random_subsets(L, l, n_sub, rng)
+
+            all_responses = []
+            for t in range(n_theta):
+                theta_indices = rng.integers(0, cfg['n_orientations'], size=L)
+                for subset in subsets:
+                    all_responses.append(
+                        compute_neuron_pre_dn(G_stacked, subset, theta_indices))
+
+            all_responses = np.stack(all_responses, axis=0)
+            stimulus_avg = np.mean(all_responses, axis=1)
+            D_stimulus_avg[l] = stimulus_avg
+
+            q25, q75 = np.percentile(stimulus_avg, [25, 75])
+            D_summary[l] = {
+                'mean': np.mean(stimulus_avg),
+                'median': np.median(stimulus_avg),
+                'std': np.std(stimulus_avg),
+                'cv': np.std(stimulus_avg) / (np.mean(stimulus_avg) + 1e-30),
+                'iqr': q75 - q25, 'q25': q25, 'q75': q75,
+                'q05': np.percentile(stimulus_avg, 5),
+                'q95': np.percentile(stimulus_avg, 95),
+            }
+
+            if verbose:
+                print(f"      l={l}: median={D_summary[l]['median']:.4f}  "
+                      f"CV={D_summary[l]['cv']:.4f}")
+
+        condition_results[label] = {
+            'lambda_base': lam,
+            'D_stimulus_avg': D_stimulus_avg,
+            'D_summary': D_summary,
+        }
+
+    return {
+        'condition_results': condition_results,
+        'lambda_broad': lambda_broad,
+        'lambda_sharp': lambda_sharp,
+    }
 
 
 # ============================================================================
@@ -295,6 +507,7 @@ def run_experiment_1(config):
 
     part_a = _run_part_a(population, cfg, N, seed, verbose=True)
     part_b = _run_part_b(population, G_stacked, cfg, verbose=True)
+    part_c = _run_part_c(cfg, verbose=True)
 
     elapsed = time.time() - start_time
     print(f"\n  Total time: {elapsed:.2f}s")
@@ -307,11 +520,19 @@ def run_experiment_1(config):
         'neuron_results': part_a['neuron_results'],
         'population_summary': part_a['population_summary'],
         'separability': part_a['separability'],
-        # Part B
+        # Part B — original (per-neuron view)
         'per_neuron_avg': part_b['per_neuron_avg'],
         'per_neuron_all': part_b['per_neuron_all'],
         'random_sampling_summary': part_b['summary'],
         'fit': part_b['fit'],
+        # Part B — NEW (per-stimulus view: D(S,theta))
+        'D_stimulus_avg': part_b['D_stimulus_avg'],
+        'D_stimulus_all': part_b['D_stimulus_all'],
+        'D_summary': part_b['D_summary'],
+        'D_fit': part_b['D_fit'],
+        'sampling_info': part_b.get('sampling_info', {}),
+        # Part C — lengthscale comparison
+        'lengthscale_comparison': part_c,
         'timing': {'total_seconds': elapsed, 'per_neuron': elapsed / N}
     }
 
@@ -568,9 +789,174 @@ def plot_results(results, output_dir, show_plot=False):
     if show_plot: plt.show()
     plt.close()
 
+    # ================================================================
+    # PLOT 6: D(S,theta) DOT-BAND — Per-STIMULUS avg (Part B, NEW)
+    # ================================================================
+    # Each dot = one (S,theta) stimulus, averaged over all N neurons
+    # Tests whether D(S,theta) concentrates around a set-size-dependent mean
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
+    D_stimulus_avg = results['D_stimulus_avg']
+    D_summary = results['D_summary']
+    D_fit = results['D_fit']
+    sampling_info = results.get('sampling_info', {})
+
+    fig6, ax6 = plt.subplots(figsize=(12, 8))
+    ax6.set_yscale('log')
+    jitter_width = 0.25
+    rng_plot6 = np.random.default_rng(1)
+    for i, l in enumerate(set_sizes):
+        vals = D_stimulus_avg[l]
+        si = sampling_info.get(l, {})
+        n_pts = len(vals)
+        n_sub = si.get('n_subsets_used', '?')
+        n_th = si.get('n_theta_draws', '?')
+        x_jitter = l + rng_plot6.uniform(-jitter_width, jitter_width, size=len(vals))
+        ax6.scatter(x_jitter, vals, s=18, alpha=0.55, color=palette[i],
+                   edgecolors='none', zorder=3,
+                   label=f'l={l} ({n_pts} stim: {n_sub}S×{n_th}θ)')
+        q25, q75 = D_summary[l]['q25'], D_summary[l]['q75']
+        ax6.plot([l-0.35, l+0.35], [D_summary[l]['median']]*2, color='black', lw=2.5, zorder=5)
+        ax6.plot([l, l], [q25, q75], color='black', lw=2, zorder=4)
+        ax6.plot([l-0.15, l+0.15], [q25]*2, color='black', lw=1.5, zorder=4)
+        ax6.plot([l-0.15, l+0.15], [q75]*2, color='black', lw=1.5, zorder=4)
+    l_fine_d = np.linspace(min(set_sizes)-0.5, max(set_sizes)+0.5, 200)
+    D_fit_curve = np.exp(D_fit['intercept'] + D_fit['slope'] * l_fine_d)
+    ax6.plot(l_fine_d, D_fit_curve, '--', color='grey', lw=2, alpha=0.8,
+            label=f'Fit: D ~ {np.exp(D_fit["intercept"]):.2f} x {D_fit["g_bar"]:.2f}^l  (R2={D_fit["r_squared"]:.4f})')
+    ax6.set_xlabel('Set Size (l)', fontsize=14)
+    ax6.set_ylabel('D(S,θ) = Mean Pre-DN Response per Stimulus (log)', fontsize=14)
+    ax6.set_title(f'D(S,θ) Concentration — Average Over {N} Neurons\n'
+                  f'Adaptive sampling: θ-draws scaled inversely with C({cfg["n_locations"]},l)',
+                  fontsize=13)
+    ax6.set_xticks(set_sizes)
+    ax6.legend(fontsize=10, loc='upper left', frameon=True)
+    sns.despine()
+    stats_lines_d = ["D(S,θ) Band Statistics (IQR)", "─"*32]
+    for l in set_sizes:
+        s = D_summary[l]
+        stats_lines_d.append(f"l={l}:  IQR={s['iqr']:.3f}  CV={s['cv']:.4f}")
+    ax6.text(0.98, 0.02, "\n".join(stats_lines_d), transform=ax6.transAxes,
+            fontsize=8.5, va='bottom', ha='right', family='monospace',
+            bbox=dict(boxstyle='round,pad=0.5', fc='#E8F8F5', ec='#1ABC9C', alpha=0.92))
+    ax6.text(0.98, 0.98, "Activity Cap Test\n"
+             "Small CV → D concentrates\n"
+             "→ Denominator ≈ f(l) only\n"
+             "→ Simplifies marginal LL",
+             transform=ax6.transAxes, fontsize=10, va='top', ha='right', style='italic',
+             bbox=dict(boxstyle='round,pad=0.5', facecolor='#D5F5E3', edgecolor='#27AE60', alpha=0.95))
+    plt.tight_layout()
+    plt.savefig(out / f'exp1_D_stimulus_dot_band_N{N}.png', dpi=300, bbox_inches='tight')
+    print(f"  Saved: exp1_D_stimulus_dot_band_N{N}.png")
+    if show_plot: plt.show()
+    plt.close()
+
+    # ================================================================
+    # PLOT 7: D(S,theta) Scaling + Normalised Spread (Part B, NEW)
+    # ================================================================
+    fig7, (ax7a, ax7b) = plt.subplots(1, 2, figsize=(14, 6))
+    D_medians = [D_summary[l]['median'] for l in set_sizes]
+    D_q25s = [D_summary[l]['q25'] for l in set_sizes]
+    D_q75s = [D_summary[l]['q75'] for l in set_sizes]
+    D_q05s = [D_summary[l]['q05'] for l in set_sizes]
+    D_q95s = [D_summary[l]['q95'] for l in set_sizes]
+
+    ax7a.set_yscale('log')
+    ax7a.fill_between(set_sizes, D_q05s, D_q95s, alpha=0.15, color=palette[1], label='5th-95th %ile')
+    ax7a.fill_between(set_sizes, D_q25s, D_q75s, alpha=0.3, color=palette[1], label='IQR (25th-75th)')
+    ax7a.plot(set_sizes, D_medians, 'o-', color=palette[1], lw=2.5, ms=9, label='Median D(S,θ)', zorder=5)
+    ax7a.plot(l_fine_d, D_fit_curve, '--', color='grey', lw=1.8, alpha=0.7,
+             label=f'Fit: g_bar={D_fit["g_bar"]:.3f}')
+    for i in range(len(set_sizes)-1):
+        fold = D_medians[i+1] / (D_medians[i] + 1e-30)
+        mid_x = (set_sizes[i] + set_sizes[i+1]) / 2
+        mid_y = np.sqrt(D_medians[i] * D_medians[i+1])
+        ax7a.annotate(f'x{fold:.1f}', xy=(mid_x, mid_y), fontsize=10,
+                     ha='center', va='center', color='#8E44AD', fontweight='bold',
+                     bbox=dict(boxstyle='round,pad=0.2', fc='#F5EEF8', ec='#8E44AD', alpha=0.9))
+    ax7a.set_xlabel('Set Size (l)', fontsize=13)
+    ax7a.set_ylabel('D(S,θ) (log)', fontsize=13)
+    ax7a.set_title('Exponential Growth of D(S,θ)', fontsize=13)
+    ax7a.set_xticks(set_sizes)
+    ax7a.legend(fontsize=9, loc='upper left', frameon=True)
+    sns.despine(ax=ax7a)
+
+    D_cvs = [D_summary[l]['cv'] for l in set_sizes]
+    D_iqr_ratio = [D_summary[l]['iqr']/(D_summary[l]['median']+1e-30) for l in set_sizes]
+    ax7b.plot(set_sizes, D_cvs, 's-', color=palette[3], lw=2, ms=9, label='CV (std/mean)')
+    ax7b.plot(set_sizes, D_iqr_ratio, 'D-', color=palette[2], lw=2, ms=9, label='IQR/median')
+    ax7b.set_xlabel('Set Size (l)', fontsize=13)
+    ax7b.set_ylabel('Normalised Spread of D(S,θ)', fontsize=13)
+    ax7b.set_title('D(S,θ) Band Width (Normalised)', fontsize=13)
+    ax7b.set_xticks(set_sizes)
+    ax7b.legend(fontsize=10, frameon=True)
+    sns.despine(ax=ax7b)
+
+    plt.tight_layout()
+    plt.savefig(out / f'exp1_D_scaling_N{N}.png', dpi=300, bbox_inches='tight')
+    print(f"  Saved: exp1_D_scaling_N{N}.png")
+    if show_plot: plt.show()
+    plt.close()
+
     # ── Summary ──
+    n_plots = 7 if N > 1 else 6
+
+    # ================================================================
+    # PLOT 8: Part C — Lengthscale comparison: D(S,θ) broad vs sharp
+    # ================================================================
+    if 'lengthscale_comparison' in results:
+        lc = results['lengthscale_comparison']
+        cond_res = lc['condition_results']
+        lam_broad = lc['lambda_broad']
+        lam_sharp = lc['lambda_sharp']
+
+        broad_D = cond_res['broad']['D_summary']
+        sharp_D = cond_res['sharp']['D_summary']
+
+        fig8, axes = plt.subplots(1, 2, figsize=(13, 5.5), sharey=True)
+
+        for panel_idx, (label, D_sum, lam, color) in enumerate([
+            ('broad', broad_D, lam_broad, palette[0]),
+            ('sharp', sharp_D, lam_sharp, palette[3] if len(palette) > 3 else palette[1]),
+        ]):
+            ax = axes[panel_idx]
+            medians = [D_sum[l]['median'] for l in set_sizes]
+            cvs = [D_sum[l]['cv'] for l in set_sizes]
+
+            ax.bar(set_sizes, cvs, width=0.6, color=color,
+                   alpha=0.7, edgecolor='black', linewidth=0.8)
+            ax.axhline(0, color='gray', ls=':', lw=1)
+
+            for i, l in enumerate(set_sizes):
+                ax.annotate(f'{cvs[i]:.4f}',
+                            (l, cvs[i]),
+                            textcoords='offset points',
+                            xytext=(0, 8),
+                            ha='center', fontsize=10, fontweight='bold')
+
+            ax.set_xlabel(r'Set Size ($\ell$)', fontsize=13)
+            if panel_idx == 0:
+                ax.set_ylabel('CV of D(S,θ)', fontsize=13)
+            panel_letter = 'A' if panel_idx == 0 else 'B'
+            ax.set_title(f'{panel_letter}.  λ = {lam:.1f}  ({label} tuning)',
+                         fontsize=12, fontweight='bold')
+            ax.set_xticks(set_sizes)
+            sns.despine(ax=ax)
+
+        plt.suptitle(
+            f'D(S,θ) Concentration: Broad vs Sharp Tuning  (N={N})',
+            fontsize=14, fontweight='bold'
+        )
+        plt.tight_layout()
+        plt.savefig(out / f'exp1_lengthscale_comparison_N{N}.png',
+                    dpi=300, bbox_inches='tight')
+        print(f"  Saved: exp1_lengthscale_comparison_N{N}.png")
+        if show_plot:
+            plt.show()
+        plt.close()
+        n_plots += 1
+
     print(f"\n  {'='*60}")
-    print(f"  EXPERIMENT 1 COMPLETE — {5 if N > 1 else 4} plots saved to {out}")
+    print(f"  EXPERIMENT 1 COMPLETE — {n_plots} plots saved to {out}")
     print(f"  {'='*60}")
 
 
