@@ -31,7 +31,7 @@ EXPERIMENTAL DESIGN
 - Each neuron's response is tracked across set sizes
 - Clean Seaborn visualizations with statistical bands
 
-Author: Mixed Selectivity Project
+Author: Yash Bharti
 Date: January 2026
 """
 
