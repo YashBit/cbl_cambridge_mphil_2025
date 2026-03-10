@@ -87,7 +87,7 @@ def run_single_experiment(
     
     try:
         if exp_num == 1:
-            from experiments.exp1_pre_normalized import run_experiment_1, plot_results
+            from experiments.core_basics.exp1_pre_normalized import run_experiment_1, plot_results
             
             exp_config = {
                 'n_neurons': n_neurons,
@@ -102,7 +102,7 @@ def run_single_experiment(
             plot_results(results, output_dir, show_plot=False)
             
         elif exp_num == 2:
-            from experiments.exp2_post_normalized import run_experiment_2, plot_results
+            from experiments.core_basics.exp2_post_normalized import run_experiment_2, plot_results
             
             exp_config = {
                 'n_neurons': n_neurons,
@@ -119,7 +119,7 @@ def run_single_experiment(
             plot_results(results, output_dir, show_plot=False)
             
         elif exp_num == 3:
-            from experiments.exp3_poisson_noise_snr import run_experiment_3, plot_results
+            from experiments.core_basics.exp3_poisson_noise_snr import run_experiment_3, plot_results
             
             exp_config = {
                 'n_neurons': n_neurons,
@@ -138,7 +138,7 @@ def run_single_experiment(
             plot_results(results, output_dir, show_plot=False)
             
         elif exp_num == 4:
-            from experiments.exp4_ml_decoding import run_experiment_4, plot_results
+            from experiments.core_basics.exp4_ml_decoding import run_experiment_4, plot_results
             
             exp_config = {
                 'n_neurons': n_neurons,
@@ -150,6 +150,23 @@ def run_single_experiment(
                 'kappa': config['kappa'],
             }
             results = run_experiment_4(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+            
+        elif exp_num == 5:
+            from experiments.bays_equivalence.figure_1 import run_experiment, plot_results
+            
+            exp_config = {
+                'M': n_neurons,
+                'n_theta': 64,
+                'n_trials': config['n_trials'],
+                'T_d': config['T_d'],
+                'sigma_sq': config['sigma_sq'],
+                'n_grid': 25,
+                'lambda_range': (0.1, 2.5),
+                'gamma_range': (1.0, 256.0),
+                'seed': seed,
+            }
+            results = run_experiment(exp_config)
             plot_results(results, output_dir, show_plot=False)
             
         else:
@@ -385,7 +402,7 @@ Examples:
     
     # Validate experiments
     for e in experiments:
-        if e not in [1, 2, 3, 4]:
+        if e not in [1, 2, 3, 4, 5]:
             print(f"Error: Invalid experiment number: {e}")
             sys.exit(1)
     
