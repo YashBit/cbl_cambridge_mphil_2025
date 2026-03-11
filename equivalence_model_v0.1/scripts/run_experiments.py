@@ -42,7 +42,7 @@ sys.path.insert(0, str(parent_dir))
 # =============================================================================
 
 DEFAULT_CONFIG = {
-    'n_orientations': 10,
+    'n_orientations': 100,
     'n_locations': 8,
     'set_sizes': [2, 4, 6, 8],
     'gamma': 100.0,
@@ -142,7 +142,7 @@ def run_single_experiment(
             
             exp_config = {
                 'n_neurons': n_neurons,
-                'n_orientations': 64,  # Finer resolution for decoding
+                'n_orientations': 200,  # Finer resolution for decoding
                 'seed': seed,
                 'gamma': config['gamma'],
                 'T_d': config['T_d'],
@@ -165,6 +165,42 @@ def run_single_experiment(
                 'lambda_range': (0.1, 2.5),
                 'gamma_range': (1.0, 256.0),
                 'seed': seed,
+            }
+            results = run_experiment(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+            
+        elif exp_num == 6:
+            from experiments.bays_equivalence.figure_2 import run_experiment, plot_results
+
+            exp_config = {
+                'M': n_neurons,
+                'n_theta': 64,
+                'n_trials': config['n_trials'],
+                'T_d': config['T_d'],
+                'sigma_sq': config['sigma_sq'],
+                'lambda_base': config['lambda_base'],
+                'gamma': config['gamma'],
+                'set_sizes': config['set_sizes'],
+                'seed': seed,
+                'n_seeds': 5,
+            }
+            results = run_experiment(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+            
+        elif exp_num == 7:
+            from experiments.nature.figure_5 import run_experiment, plot_results
+
+            exp_config = {
+                'M': n_neurons,
+                'n_theta': 64,
+                'n_trials': config['n_trials'],
+                'T_d': config['T_d'],
+                'sigma_sq': config['sigma_sq'],
+                'lambda_base': config['lambda_base'],
+                'gamma': config['gamma'],
+                'set_sizes': [1, 2, 3, 4, 5, 6, 7, 8],
+                'seed': seed,
+                'n_seeds': 5,
             }
             results = run_experiment(exp_config)
             plot_results(results, output_dir, show_plot=False)
@@ -332,7 +368,7 @@ Examples:
     
     # Experiment selection
     parser.add_argument('--exp', type=int, nargs='+', default=None,
-                       help='Experiment number(s): 1, 2, 3, 4')
+                       help='Experiment number(s): 1-4 (core), 5-6 (Bays Fig 1,2), 7 (Bays Fig 5)')
     parser.add_argument('--all', action='store_true',
                        help='Run all experiments')
     parser.add_argument('--batch', action='store_true',
@@ -378,11 +414,11 @@ Examples:
     
     # Determine experiments to run
     if args.batch:
-        experiments = [1, 2, 3, 4]
+        experiments = [1, 2, 3, 4, 5, 6, 7]
         seeds = BATCH_SEEDS
         neurons = BATCH_NEURONS
     elif args.all:
-        experiments = [1, 2, 3, 4]
+        experiments = [1, 2, 3, 4, 5, 6, 7]
         seeds = args.seeds
         neurons = args.neurons
     elif args.exp:
@@ -402,7 +438,7 @@ Examples:
     
     # Validate experiments
     for e in experiments:
-        if e not in [1, 2, 3, 4, 5]:
+        if e not in [1, 2, 3, 4, 5, 6, 7]:
             print(f"Error: Invalid experiment number: {e}")
             sys.exit(1)
     

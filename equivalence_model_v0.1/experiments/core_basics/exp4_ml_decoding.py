@@ -128,6 +128,10 @@ class Exp4Config:
     # Random seed
     seed: int = 42
 
+    # Part E override: n_orientations for the sub-unit lambda sweep
+    # If None, uses PART_E_N_ORIENTATIONS constant (256)
+    part_e_n_theta: int = None
+
     @property
     def total_activity(self) -> float:
         return self.gamma * self.n_neurons
@@ -602,9 +606,13 @@ def _run_part_d(cfg, rng, verbose=True):
 
 PART_E_LAMBDAS = np.linspace(0.2, 0.8, 5).tolist()  # [0.2, 0.35, 0.5, 0.65, 0.8]
 PART_E_T_D = 2.0              # same high-SNR regime as Part D
-PART_E_N_ORIENTATIONS = 256   # fine grid: Δθ ≈ 1.4° ensures even λ=0.20 is well-resolved
+PART_E_N_ORIENTATIONS = 256   # default fine grid: Δθ ≈ 1.4° ensures even λ=0.20 is well-resolved
 PART_E_SET_SIZES = (1, 2, 4, 6, 8)   # include l=1 single-item baseline
 PART_E_N_SEEDS = 5            # number of independent seeds for multi-seed averaging
+
+# NOTE: Part E n_orientations can be overridden via config['part_e_n_theta']
+#       to test how grid resolution interacts with tuning sharpness.
+#       CLI: python scripts/run_experiments.py --exp 4 --n_theta 128
 
 
 def _run_part_e(cfg, rng, verbose=True):
@@ -637,7 +645,7 @@ def _run_part_e(cfg, rng, verbose=True):
     """
     lambdas = PART_E_LAMBDAS
     T_d = PART_E_T_D
-    n_ori = PART_E_N_ORIENTATIONS
+    n_ori = getattr(cfg, 'part_e_n_theta', None) or PART_E_N_ORIENTATIONS
     set_sizes_e = PART_E_SET_SIZES
     n_seeds = PART_E_N_SEEDS
 
@@ -776,6 +784,7 @@ def run_experiment_4(config: Dict) -> Dict:
         seed=config.get('seed', 42),
         lambda_base=config.get('lambda_base', 0.5),
         sigma_lambda=config.get('sigma_lambda', 0.3),
+        part_e_n_theta=config.get('part_e_n_theta', None),
     )
 
     print("=" * 70)
@@ -787,7 +796,13 @@ def run_experiment_4(config: Dict) -> Dict:
 
     compare_complexity(cfg.n_neurons, cfg.n_orientations, list(cfg.set_sizes))
 
+    print(f"The number of orientations is: {cfg.n_orientations}")
+    
     rng = np.random.RandomState(cfg.seed)
+
+    # Optional part filtering: run only specified sub-experiments
+    run_parts = config.get('run_parts', None)  # None = run all
+    run_all = run_parts is None
 
     # Generate shared population for Part A
     population = generate_neuron_population(
@@ -800,34 +815,37 @@ def run_experiment_4(config: Dict) -> Dict:
     )
     theta_values = population[0]['orientations']
 
-    part_a = _run_part_a(population, theta_values, cfg, rng)
-    part_b = _run_part_b(cfg, rng)
-    part_c = _run_part_c(cfg, rng)
-    part_d = _run_part_d(cfg, rng)
-    part_e = _run_part_e(cfg, rng)
+    part_a = _run_part_a(population, theta_values, cfg, rng) if (run_all or 'a' in run_parts) else None
+    part_b = _run_part_b(cfg, rng)  if (run_all or 'b' in run_parts) else None
+    part_c = _run_part_c(cfg, rng)  if (run_all or 'c' in run_parts) else None
+    part_d = _run_part_d(cfg, rng)  if (run_all or 'd' in run_parts) else None
+    part_e = _run_part_e(cfg, rng)  if (run_all or 'e' in run_parts) else None
 
     print(f"\n{'='*70}")
     print("EXPERIMENT 4 COMPLETE")
     print(f"{'='*70}")
 
-    return {
+    results = {
         'config': config,
         'exp_config': cfg,
         'theta_values': theta_values,
-        # Part A
-        'multi_item': part_a['multi_item'],
-        'single_item': part_a['single_item'],
-        'scaling': part_a['scaling'],
-        # Part B
-        'bias': part_b,
-        # Part C
-        'lengthscale_sweep': part_c,
-        # Part D
-        'precision_comparison': part_d,
-        # Part E
-        'sub_unit_sweep': part_e,
         'method': 'efficient_factorized',
     }
+
+    if part_a is not None:
+        results['multi_item'] = part_a['multi_item']
+        results['single_item'] = part_a['single_item']
+        results['scaling'] = part_a['scaling']
+    if part_b is not None:
+        results['bias'] = part_b
+    if part_c is not None:
+        results['lengthscale_sweep'] = part_c
+    if part_d is not None:
+        results['precision_comparison'] = part_d
+    if part_e is not None:
+        results['sub_unit_sweep'] = part_e
+
+    return results
 
 
 # Backward-compatibility alias
@@ -1323,16 +1341,64 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
 # =============================================================================
 
 if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='Experiment 4: Multi-Item ML Decoding',
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
+Examples:
+  # Run all parts with defaults:
+  python exp4_ml_decoding.py
+
+  # Run only Part E with fine grid (n_theta=512):
+  python exp4_ml_decoding.py --part e --n_theta 512
+
+  # Run all parts with custom neurons/seed:
+  python exp4_ml_decoding.py --n_neurons 200 --seed 99
+
+  # Run Part E with coarse grid to test aliasing:
+  python exp4_ml_decoding.py --part e --n_theta 32 --n_trials 100
+        """,
+    )
+    parser.add_argument('--n_neurons', type=int, default=100)
+    parser.add_argument('--n_orientations', type=int, default=32,
+                        help='Grid resolution for Parts A-D (default: 32)')
+    parser.add_argument('--n_theta', type=int, default=None,
+                        help='Grid resolution override for Part E (default: 256).\n'
+                             'Controls the x-axis granularity of the orientation grid.')
+    parser.add_argument('--n_locations', type=int, default=16)
+    parser.add_argument('--gamma', type=float, default=100.0)
+    parser.add_argument('--sigma_sq', type=float, default=1e-6)
+    parser.add_argument('--T_d', type=float, default=0.1)
+    parser.add_argument('--n_trials', type=int, default=200)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--set_sizes', type=int, nargs='+', default=[2, 4, 6, 8])
+    parser.add_argument('--output_dir', type=str, default='results/exp4')
+    parser.add_argument('--no_plot', action='store_true')
+    parser.add_argument('--part', type=str, default=None,
+                        help='Run only a specific part: a, b, c, d, or e.\n'
+                             'If omitted, runs all parts.')
+
+    args = parser.parse_args()
+
     config = {
-        'n_neurons': 100,
-        'n_orientations': 32,
-        'n_locations': 16,
-        'gamma': 100.0,
-        'sigma_sq': 1e-6,
-        'T_d': 0.1,
-        'n_trials': 200,
-        'seed': 42,
-        'set_sizes': [2, 4, 6, 8],
+        'n_neurons': args.n_neurons,
+        'n_orientations': args.n_orientations,
+        'n_locations': args.n_locations,
+        'gamma': args.gamma,
+        'sigma_sq': args.sigma_sq,
+        'T_d': args.T_d,
+        'n_trials': args.n_trials,
+        'seed': args.seed,
+        'set_sizes': args.set_sizes,
+        'part_e_n_theta': args.n_theta,
     }
+
+    if args.part:
+        config['run_parts'] = [args.part.lower()]
+
     results = run_experiment_4(config)
-    plot_results(results, 'results/exp4', show_plot=True)
+
+    if not args.no_plot:
+        plot_results(results, args.output_dir, show_plot=True)

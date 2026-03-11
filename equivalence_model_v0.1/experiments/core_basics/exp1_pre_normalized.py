@@ -88,7 +88,7 @@ from analysis.separability import (
 
 DEFAULT_CONFIG = {
     'n_neurons': 100,
-    'n_orientations': 10,
+    'n_orientations': 200,
     'n_locations': 8,
     'set_sizes': [2, 4, 6, 8],
     'seed': 42,
@@ -670,6 +670,8 @@ def plot_results(results, output_dir, show_plot=False):
     print(f"  CREATING EXPERIMENT 1 PLOTS")
     print(f"  {'='*60}")
 
+    n_plots = 0
+
     # ── Shared Part A data ──
     pop_summary = results['population_summary']
     R_means = [pop_summary[l]['R_mean'] for l in set_sizes]
@@ -1071,11 +1073,19 @@ def plot_results(results, output_dir, show_plot=False):
         stc = results['sub_tuning_curves']
         subsets_per_l = stc['subsets_per_l']
         n_ori = cfg['n_orientations']
+        # Sanity: if the stored G has a different orientation count, use that
+        first_G = next(iter(stc['d1_G'].values()))
+        if first_G.shape[2] != n_ori:
+            n_ori = first_G.shape[2]
         theta_axis = np.arange(n_ori)
+
+        # Sensible tick spacing: ~10 ticks regardless of n_ori
+        tick_step = max(1, n_ori // 10)
+        theta_ticks = np.arange(0, n_ori, tick_step)
 
         # ── Colour palette: one colour per neuron, thick lines ──
         # Use a perceptually distinct colourmap so neurons are separable
-        n_neurons_plot = min(N, 20)  # cap at 20 for readability
+        n_neurons_plot = min(N, 10)  # cap at 20 for readability
         cmap = plt.cm.get_cmap('tab20', n_neurons_plot)
         neuron_colors = [cmap(i) for i in range(n_neurons_plot)]
 
@@ -1092,7 +1102,7 @@ def plot_results(results, output_dir, show_plot=False):
         for l in set_sizes:
             subset = subsets_per_l[l]
             n_locs = len(subset)
-
+            # n_locs = 100 
             fig_d1, axes_d1 = plt.subplots(
                 n_seeds, n_locs,
                 figsize=(4.5 * n_locs, 4.0 * n_seeds),
@@ -1124,7 +1134,7 @@ def plot_results(results, output_dir, show_plot=False):
                     if row == 0:
                         ax.set_title(f'Location k={k}', fontsize=12,
                                      fontweight='bold')
-                    ax.set_xticks(theta_axis)
+                    ax.set_xticks(theta_ticks)
                     ax.tick_params(labelsize=9)
                     ax.grid(True, alpha=0.25)
 
@@ -1145,7 +1155,7 @@ def plot_results(results, output_dir, show_plot=False):
             if show_plot:
                 plt.show()
             plt.close()
-            n_plots += 1
+            # n_plots += 1
 
         # ────────────────────────────────────────────────────────────
         # D2: MULTI-LENGTHSCALE — one figure per set size l
@@ -1189,7 +1199,7 @@ def plot_results(results, output_dir, show_plot=False):
                     if row == 0:
                         ax.set_title(f'Location k={k}', fontsize=12,
                                      fontweight='bold')
-                    ax.set_xticks(theta_axis)
+                    ax.set_xticks(theta_ticks)
                     ax.tick_params(labelsize=9)
                     ax.grid(True, alpha=0.25)
 
@@ -1230,7 +1240,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     config = {
-        'n_neurons': args.n_neurons, 'n_orientations': 10, 'n_locations': 8,
+        'n_neurons': args.n_neurons, 'n_orientations': 200, 'n_locations': 8,
         'set_sizes': [2, 4, 6, 8], 'seed': args.seed,
         'lambda_base': 0.3, 'sigma_lambda': 0.5,
     }
