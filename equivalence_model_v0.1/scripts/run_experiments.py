@@ -2,12 +2,40 @@
 Master script to run all experiments with multiple seeds and neuron counts.
 
 =============================================================================
+EXPERIMENT INDEX
+=============================================================================
+
+Core framework experiments (exp 1-4):
+    1 — Pre-normalised response analysis
+    2 — Post-normalised (DN) response analysis
+    3 — Poisson noise and SNR degradation
+    4 — Efficient ML decoding
+
+Bays (2014) equivalence experiments (exp 5-9):
+    5  — Figure 1 d,e,f: variance, kurtosis, exponent vs (λ, γ)
+    6  — Figure 2: error distributions and scaling vs set size
+    7  — Figure 3: cued recall with optimal weighting
+    8  — Figure 4: robustness (broad, narrow, baseline, hetero, cosine, corr)
+    9  — Figure 5: effects of baseline activity on ML parameters
+
+Bays & Brady (2024) equivalence experiments (exp 10):
+    10 — Figure 5: SD vs set size, continuous rise, √l prediction
+
+=============================================================================
 USAGE
 =============================================================================
 
 Single experiment:
     python scripts/run_experiments.py --exp 1
-    python scripts/run_experiments.py --exp 2 --n_neurons 50 --seed 22
+    python scripts/run_experiments.py --exp 6 --n_neurons 50 --seed 22
+
+Experiment groups:
+    python scripts/run_experiments.py --core          # experiments 1-4 only
+    python scripts/run_experiments.py --bays          # experiments 5-10 only
+    python scripts/run_experiments.py --all           # all experiments 1-10
+
+Multiple experiments:
+    python scripts/run_experiments.py --exp 5 6 7 8 9 10
 
 Multiple seeds (for statistical robustness):
     python scripts/run_experiments.py --exp 3 --seeds 42 43 44 45 46
@@ -15,11 +43,15 @@ Multiple seeds (for statistical robustness):
 Multiple neuron counts (scaling analysis):
     python scripts/run_experiments.py --exp all --neurons 100 1000 10000
 
-Full batch run (all experiments, multiple seeds, multiple neuron counts):
+Full batch run (all experiments, default seeds [42-46], neurons [100, 10000]):
     python scripts/run_experiments.py --batch
 
 Custom batch:
     python scripts/run_experiments.py --exp 3 4 --seeds 1 2 3 --neurons 100 10000
+
+Override experiment parameters:
+    python scripts/run_experiments.py --exp 6 --gamma 200.0 --T_d 0.2
+    python scripts/run_experiments.py --exp 8 --n_trials 50000
 
 =============================================================================
 """
@@ -41,8 +73,23 @@ sys.path.insert(0, str(parent_dir))
 # CONFIGURATION
 # =============================================================================
 
+ALL_EXPERIMENTS = list(range(1, 11))  # 1 through 10
+
+EXPERIMENT_NAMES = {
+    1: 'Pre-normalised response analysis',
+    2: 'Post-normalised (DN) response analysis',
+    3: 'Poisson noise and SNR degradation',
+    4: 'Efficient ML decoding',
+    5: 'Bays (2014) Fig 1 d,e,f — variance/kurtosis/exponent grid',
+    6: 'Bays (2014) Fig 2 — error distributions vs set size',
+    7: 'Bays (2014) Fig 3 — cued recall with optimal weighting',
+    8: 'Bays (2014) Fig 4 — robustness of error distributions',
+    9: 'Bays (2014) Fig 5 — baseline activity effects',
+    10: 'Bays & Brady (2024) Fig 5 — SD vs set size',
+}
+
 DEFAULT_CONFIG = {
-    'n_orientations': 10,
+    'n_orientations': 100,
     'n_locations': 8,
     'set_sizes': [2, 4, 6, 8],
     'gamma': 100.0,
@@ -86,8 +133,12 @@ def run_single_experiment(
     start_time = time.time()
     
     try:
+        # =================================================================
+        # CORE FRAMEWORK EXPERIMENTS (1-4)
+        # =================================================================
+
         if exp_num == 1:
-            from experiments.exp1_pre_normalized import run_experiment_1, plot_results
+            from experiments.core_basics.exp1_pre_normalized import run_experiment_1, plot_results
             
             exp_config = {
                 'n_neurons': n_neurons,
@@ -102,7 +153,7 @@ def run_single_experiment(
             plot_results(results, output_dir, show_plot=False)
             
         elif exp_num == 2:
-            from experiments.exp2_post_normalized import run_experiment_2, plot_results
+            from experiments.core_basics.exp2_post_normalized import run_experiment_2, plot_results
             
             exp_config = {
                 'n_neurons': n_neurons,
@@ -119,7 +170,7 @@ def run_single_experiment(
             plot_results(results, output_dir, show_plot=False)
             
         elif exp_num == 3:
-            from experiments.exp3_poisson_noise_snr import run_experiment_3, plot_results
+            from experiments.core_basics.exp3_poisson_noise_snr import run_experiment_3, plot_results
             
             exp_config = {
                 'n_neurons': n_neurons,
@@ -138,11 +189,11 @@ def run_single_experiment(
             plot_results(results, output_dir, show_plot=False)
             
         elif exp_num == 4:
-            from experiments.exp4_ml_decoding import run_experiment_4, plot_results
+            from experiments.core_basics.exp4_ml_decoding import run_experiment_4, plot_results
             
             exp_config = {
                 'n_neurons': n_neurons,
-                'n_orientations': 64,  # Finer resolution for decoding
+                'n_orientations': 200,  # Finer resolution for decoding
                 'seed': seed,
                 'gamma': config['gamma'],
                 'T_d': config['T_d'],
@@ -150,6 +201,135 @@ def run_single_experiment(
                 'kappa': config['kappa'],
             }
             results = run_experiment_4(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+
+        # =================================================================
+        # BAYS (2014) EQUIVALENCE EXPERIMENTS (5-9)
+        # =================================================================
+            
+        elif exp_num == 5:
+            from experiments.bays_equivalence.figure_1 import run_experiment, plot_results
+            
+            exp_config = {
+                'M': n_neurons,
+                'n_theta': 64,
+                'n_trials': config['n_trials'],
+                'T_d': config['T_d'],
+                'sigma_sq': config['sigma_sq'],
+                'n_grid': 25,
+                'lambda_range': (0.1, 2.5),
+                'gamma_range': (1.0, 256.0),
+                'seed': seed,
+            }
+            results = run_experiment(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+            
+        elif exp_num == 6:
+            from experiments.bays_equivalence.figure_2 import run_experiment, plot_results
+
+            exp_config = {
+                'M': n_neurons,
+                'n_theta': 64,
+                'n_trials': config['n_trials'],
+                'T_d': config['T_d'],
+                'sigma_sq': config['sigma_sq'],
+                'lambda_base': config['lambda_base'],
+                'gamma': config['gamma'],
+                'set_sizes': config['set_sizes'],
+                'seed': seed,
+                'n_seeds': 5,
+            }
+            results = run_experiment(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+            
+        elif exp_num == 7:
+            from experiments.bays_equivalence.figure_3 import run_experiment, plot_results
+
+            exp_config = {
+                'M': n_neurons,
+                'n_theta': 64,
+                'n_trials': config['n_trials'],
+                'n_trials_sweep': min(config['n_trials'], 2000),
+                'T_d': config['T_d'],
+                'sigma_sq': config['sigma_sq'],
+                'lambda_base': config['lambda_base'],
+                'gamma': config['gamma'],
+                'set_sizes': [2, 4, 8],
+                'cue_ratio': 3.0,
+                'alpha_range': (1.0, 8.0),
+                'n_alpha': 15,
+                'seed': seed,
+                'n_seeds': 3,
+                'n_bins': 50,
+            }
+            results = run_experiment(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+
+        elif exp_num == 8:
+            from experiments.bays_equivalence.figure_4 import run_experiment, plot_results
+
+            exp_config = {
+                'n_theta': 64,
+                'n_trials': config['n_trials'],
+                'T_d': config['T_d'],
+                'sigma_sq': config['sigma_sq'],
+                'lambda_broad': 1.0,
+                'lambda_narrow': 0.3,
+                'lambda_std': 0.1,
+                'baseline_frac': 0.25,
+                'c0': 0.25,
+                'gammas': [1, 2, 4, 8, 16, 32, 64, 128],
+                'pop_sizes': [100, 1000],
+                'n_bins': 50,
+                'seed': seed,
+            }
+            results = run_experiment(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+
+        elif exp_num == 9:
+            from experiments.bays_equivalence.figure_5 import run_experiment, plot_results
+
+            exp_config = {
+                'M': n_neurons,
+                'n_theta': 64,
+                'T_d': config['T_d'],
+                'sigma_sq': config['sigma_sq'],
+                'lambda_ref': 0.5,
+                'gamma_ref': config['gamma'],
+                'set_sizes': [1, 2, 4, 8],
+                'baseline_fracs': [0.0, 0.05, 0.20, 0.50, 0.80, 0.95],
+                'n_trials_fit': min(config['n_trials'], 3000),
+                'n_trials_final': config['n_trials'],
+                'n_gamma_grid': 20,
+                'n_lambda_grid': 8,
+                'gamma_range': (10.0, 1e6),
+                'lambda_range': (0.3, 1.0),
+                'seed': seed,
+                'n_seeds': 3,
+            }
+            results = run_experiment(exp_config)
+            plot_results(results, output_dir, show_plot=False)
+
+        # =================================================================
+        # BAYS & BRADY (2024) EQUIVALENCE EXPERIMENTS (10)
+        # =================================================================
+
+        elif exp_num == 10:
+            from experiments.nature.figure_5 import run_experiment, plot_results
+
+            exp_config = {
+                'M': n_neurons,
+                'n_theta': 64,
+                'n_trials': config['n_trials'],
+                'T_d': config['T_d'],
+                'sigma_sq': config['sigma_sq'],
+                'lambda_base': config['lambda_base'],
+                'gamma': config['gamma'],
+                'set_sizes': [1, 2, 3, 4, 5, 6, 7, 8],
+                'seed': seed,
+                'n_seeds': 5,
+            }
+            results = run_experiment(exp_config)
             plot_results(results, output_dir, show_plot=False)
             
         else:
@@ -159,6 +339,7 @@ def run_single_experiment(
         return {
             'status': 'success',
             'experiment': exp_num,
+            'name': EXPERIMENT_NAMES.get(exp_num, ''),
             'n_neurons': n_neurons,
             'seed': seed,
             'elapsed_seconds': elapsed,
@@ -171,6 +352,7 @@ def run_single_experiment(
         return {
             'status': 'error',
             'experiment': exp_num,
+            'name': EXPERIMENT_NAMES.get(exp_num, ''),
             'n_neurons': n_neurons,
             'seed': seed,
             'elapsed_seconds': elapsed,
@@ -197,6 +379,8 @@ def run_batch(
     print("=" * 70)
     print(f"\nConfiguration:")
     print(f"  Experiments:   {experiments}")
+    for e in experiments:
+        print(f"                 {e}: {EXPERIMENT_NAMES.get(e, '?')}")
     print(f"  Neuron counts: {neurons_list}")
     print(f"  Seeds:         {seeds_list}")
     print(f"  Total runs:    {total_runs}")
@@ -217,7 +401,9 @@ def run_batch(
                 run_count += 1
                 
                 print("\n" + "=" * 70)
-                print(f"RUN {run_count}/{total_runs}: Exp {exp_num}, N={n_neurons:,}, seed={seed}")
+                print(f"RUN {run_count}/{total_runs}: "
+                      f"Exp {exp_num} ({EXPERIMENT_NAMES.get(exp_num, '')}), "
+                      f"N={n_neurons:,}, seed={seed}")
                 print("=" * 70)
                 
                 result = run_single_experiment(
@@ -230,8 +416,8 @@ def run_batch(
                 
                 results.append(result)
                 
-                status_icon = "âœ“" if result['status'] == 'success' else "âœ—"
-                print(f"\n{status_icon} Completed in {result['elapsed_seconds']:.1f}s")
+                status_icon = "OK" if result['status'] == 'success' else "FAIL"
+                print(f"\n[{status_icon}] Completed in {result['elapsed_seconds']:.1f}s")
     
     batch_elapsed = time.time() - batch_start
     
@@ -256,24 +442,24 @@ def run_batch(
     print("\n" + "=" * 70)
     print("BATCH COMPLETE")
     print("=" * 70)
-    print(f"\nðŸ“Š Summary:")
+    print(f"\nSummary:")
     print(f"   Total runs:    {total_runs}")
     print(f"   Successful:    {summary['successful']}")
     print(f"   Failed:        {summary['failed']}")
     print(f"   Total time:    {batch_elapsed/60:.1f} minutes")
-    print(f"\nðŸ“ Output: {summary_dir}")
-    print(f"ðŸ“„ Summary: {summary_file}")
+    print(f"\n   Output: {summary_dir}")
+    print(f"   Summary: {summary_file}")
     
-    print(f"\nâ±ï¸  Timing by experiment:")
+    print(f"\nTiming by experiment:")
     for exp_num in experiments:
         exp_results = [r for r in results if r['experiment'] == exp_num and r['status'] == 'success']
         if exp_results:
             avg_time = sum(r['elapsed_seconds'] for r in exp_results) / len(exp_results)
-            print(f"   Exp {exp_num}: {avg_time:.1f}s average")
+            print(f"   Exp {exp_num} ({EXPERIMENT_NAMES.get(exp_num, '')}): {avg_time:.1f}s average")
     
     errors = [r for r in results if r['status'] == 'error']
     if errors:
-        print(f"\nâš ï¸  Errors ({len(errors)}):")
+        print(f"\nErrors ({len(errors)}):")
         for e in errors:
             print(f"   Exp {e['experiment']}, N={e['n_neurons']}, seed={e['seed']}: {e['error']}")
     
@@ -289,37 +475,45 @@ def main():
         description='Run Mixed Selectivity Experiments',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Experiments:
+  Core framework (1-4):
+    1  Pre-normalised response analysis
+    2  Post-normalised (DN) response analysis
+    3  Poisson noise and SNR degradation
+    4  Efficient ML decoding
+
+  Bays (2014) equivalence (5-9):
+    5  Figure 1 d,e,f — variance/kurtosis/exponent vs (lambda, gamma)
+    6  Figure 2 — error distributions vs set size
+    7  Figure 3 — cued recall with optimal weighting
+    8  Figure 4 — robustness (broad, narrow, baseline, hetero, cosine, corr)
+    9  Figure 5 — baseline activity effects on ML parameters
+
+  Bays & Brady (2024) equivalence (10):
+    10 Figure 5 — SD vs set size, continuous rise, sqrt(l) prediction
+
 Examples:
-  # Single experiment
   python run_experiments.py --exp 2
-  
-  # With specific parameters
   python run_experiments.py --exp 2 --n_neurons 50 --seed 22
-  
-  # Multiple experiments
-  python run_experiments.py --exp 2 3 4
-  
-  # Multiple seeds
+  python run_experiments.py --exp 5 6 7 8 9
   python run_experiments.py --exp 2 --seeds 42 43 44
-  
-  # Multiple neuron counts
   python run_experiments.py --exp 2 --neurons 100 10000
-  
-  # Full batch (default seeds and neurons)
   python run_experiments.py --batch
-  
-  # Custom batch
   python run_experiments.py --exp 2 3 --seeds 1 2 3 --neurons 100 1000
         """
     )
     
     # Experiment selection
     parser.add_argument('--exp', type=int, nargs='+', default=None,
-                       help='Experiment number(s): 1, 2, 3, 4')
+                       help='Experiment number(s): 1-4 (core), 5-9 (Bays 2014), 10 (Bays & Brady 2024)')
     parser.add_argument('--all', action='store_true',
-                       help='Run all experiments')
+                       help='Run all experiments (1-9)')
     parser.add_argument('--batch', action='store_true',
                        help='Run full batch with default seeds [42-46] and neurons [100, 10000]')
+    parser.add_argument('--core', action='store_true',
+                       help='Run core experiments only (1-4)')
+    parser.add_argument('--bays', action='store_true',
+                       help='Run Bays equivalence experiments only (5-9)')
     
     # Multi-run parameters
     parser.add_argument('--seeds', type=int, nargs='+', default=[42],
@@ -334,7 +528,7 @@ Examples:
                        help='Random seed (single run)')
     
     # Experiment parameters
-    parser.add_argument('--n_orientations', type=int, default=10)
+    parser.add_argument('--n_orientations', type=int, default=100)
     parser.add_argument('--n_locations', type=int, default=8)
     parser.add_argument('--gamma', type=float, default=100.0)
     parser.add_argument('--sigma_sq', type=float, default=1e-6)
@@ -361,11 +555,19 @@ Examples:
     
     # Determine experiments to run
     if args.batch:
-        experiments = [1, 2, 3, 4]
+        experiments = ALL_EXPERIMENTS
         seeds = BATCH_SEEDS
         neurons = BATCH_NEURONS
     elif args.all:
+        experiments = ALL_EXPERIMENTS
+        seeds = args.seeds
+        neurons = args.neurons
+    elif args.core:
         experiments = [1, 2, 3, 4]
+        seeds = args.seeds
+        neurons = args.neurons
+    elif args.bays:
+        experiments = [5, 6, 7, 8, 9, 10]
         seeds = args.seeds
         neurons = args.neurons
     elif args.exp:
@@ -373,7 +575,7 @@ Examples:
         seeds = args.seeds
         neurons = args.neurons
     else:
-        print("Error: Specify --exp, --all, or --batch")
+        print("Error: Specify --exp, --all, --core, --bays, or --batch")
         parser.print_help()
         sys.exit(1)
     
@@ -385,8 +587,8 @@ Examples:
     
     # Validate experiments
     for e in experiments:
-        if e not in [1, 2, 3, 4]:
-            print(f"Error: Invalid experiment number: {e}")
+        if e not in ALL_EXPERIMENTS:
+            print(f"Error: Invalid experiment number: {e}. Valid: {ALL_EXPERIMENTS}")
             sys.exit(1)
     
     # Run
@@ -396,8 +598,12 @@ Examples:
     
     if len(experiments) == 1 and len(seeds) == 1 and len(neurons) == 1:
         # Single run
+        exp_num = experiments[0]
+        print(f"\nExperiment {exp_num}: {EXPERIMENT_NAMES.get(exp_num, '')}")
+        print(f"  N={neurons[0]}, seed={seeds[0]}")
+        
         result = run_single_experiment(
-            exp_num=experiments[0],
+            exp_num=exp_num,
             n_neurons=neurons[0],
             seed=seeds[0],
             config=config,
@@ -405,10 +611,10 @@ Examples:
         )
         
         if result['status'] == 'success':
-            print(f"\nâœ“ Experiment {experiments[0]} complete ({result['elapsed_seconds']:.1f}s)")
+            print(f"\n[OK] Experiment {exp_num} complete ({result['elapsed_seconds']:.1f}s)")
             print(f"  Output: {result['output_dir']}")
         else:
-            print(f"\nâœ— Experiment {experiments[0]} failed: {result.get('error', 'Unknown error')}")
+            print(f"\n[FAIL] Experiment {exp_num} failed: {result.get('error', 'Unknown error')}")
             if 'traceback' in result:
                 print(result['traceback'])
     else:
