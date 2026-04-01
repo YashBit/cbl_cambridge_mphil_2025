@@ -1,15 +1,31 @@
 """
 Bays (2014) Figure 2 — GP-Based Model Predictions (no human data)
 
-Recreates the MODEL curves (red lines) from panels c, d, e, f:
+Recreates the MODEL curves from panels c, d, e, f:
     c — Error distributions at set sizes 1, 2, 4, 8
     d — Variance vs set size (power law on log-log)
     e — Deviation from circular normal ("Mexican hat")
     f — Kurtosis vs set size
 
-DN enters here: effective gain per item = γ / N.
-Fixed parameters (λ_base, γ) play the role of Bays's (ω, γ).
-Multiple seeds → ±1 SE bands (matching Bays's dashed lines).
+=============================================================================
+KEY DESIGN CHOICE: FULL MULTI-LOCATION FACTORISED DECODER
+=============================================================================
+
+Neurons have tuning at MULTIPLE locations, spikes carry ENTANGLED
+information, and the decoder MARGINALISES over non-cued items.
+
+Pipeline per trial at set size l:
+    1. Generate M neurons with GP tuning at l locations
+    2. Sample true orientations θ₁, ..., θₗ
+    3. Pre-normalised response: r_i^pre = exp(Σ_k f_{i,k}(θ_k))
+    4. DN: r_i = γ · r_i^pre / (σ² + M⁻¹ Σ_j r_j^pre)  [dn_pointwise]
+    5. Poisson spikes
+    6. Efficient factorised ML decode with marginalisation:
+         L_k(θ) = Σ_i n_i · f_{i,k}(θ)
+         l_marginal(θ_c) = L_c(θ_c) + Σ_{k≠c} logsumexp(L_k)
+         θ̂_c = argmax l_marginal(θ_c)
+
+Complexity: O(M · l · n_θ) per trial — linear in set size.
 
 Usage:
     from experiments.bays_equivalence.figure_2 import run_experiment, plot_results
@@ -20,86 +36,79 @@ Usage:
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-from scipy.special import ive
-from scipy.optimize import brentq
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 import time
 
-# ── Core module imports ──
-from core.gaussian_process import periodic_rbf_kernel, sample_gp_function
-from core.poisson_spike import generate_spikes
-from core.ml_decoder import compute_circular_error
+from core.encoder.poisson_spike import generate_spikes
+from core.encoder.divisive_normalization import dn_pointwise
+from core.decoder.ml_decoder import (
+    compute_spike_weighted_log_tuning,
+    compute_marginal_log_likelihood_efficient,
+    compute_circular_error,
+)
 
-# ── Shared utilities from figure_1 (DRY) ──
-from experiments.bays_equivalence.figure_1 import (
-    _generate_population,
-    _run_trials_at_gain,
+from experiments.bays_equivalence.bays_utils import (
     circular_variance,
     circular_kurtosis,
-    _circular_moments,
+    compute_deviation_from_normal,
+    generate_population,
 )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DEVIATION FROM CIRCULAR NORMAL (Figure 2e specific)
+# TRIAL ENGINE — MULTI-LOCATION, FACTORISED MARGINALISED DECODER
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _bessel_ratio(kappa: float) -> float:
-    """I₁(κ)/I₀(κ) using exponentially scaled Bessels (overflow-safe)."""
-    return ive(1, kappa) / ive(0, kappa)
-
-
-def _rho_to_kappa(rho: float) -> float:
-    """Invert A(κ) = I₁(κ)/I₀(κ) = ρ to find von Mises concentration κ."""
-    if rho < 1e-10:
-        return 0.0
-    if rho > 1 - 1e-10:
-        return 1e4
-    return brentq(lambda k: _bessel_ratio(k) - rho, 1e-8, 1e4)
-
-
-def _von_mises_pdf(theta: np.ndarray, kappa: float) -> np.ndarray:
-    """Von Mises PDF: p(θ; κ) = exp(κ·cos(θ)) / (2π·I₀(κ)), overflow-safe."""
-    # log p = κ·cos(θ) − log(2π) − log(I₀(κ))
-    # log(I₀(κ)) = κ + log(ive(0, κ))
-    log_p = kappa * np.cos(theta) - np.log(2 * np.pi) - kappa - np.log(ive(0, kappa))
-    return np.exp(log_p)
-
-
-def compute_deviation_from_normal(
-    errors: np.ndarray, n_bins: int = 50
-) -> Dict:
+def _run_multiloc_trials(
+    f_all: List[np.ndarray],
+    thetas: np.ndarray,
+    active_locs: Tuple[int, ...],
+    cued_index: int,
+    gamma: float,
+    T_d: float,
+    sigma_sq: float,
+    n_trials: int,
+    rng: np.random.RandomState,
+) -> np.ndarray:
     """
-    Compute deviation of error histogram from matched circular normal.
+    Run n_trials of multi-location encode → spike → factorised decode.
 
-    1. Histogram errors into n_bins bins → empirical density
-    2. Compute ρ₁ = |m₁| from errors
-    3. Find von Mises κ matching that ρ₁
-    4. Evaluate von Mises PDF at bin centers
-    5. Deviation = empirical - von Mises
-
-    Returns dict with bin_centers, empirical, von_mises, deviation.
+    Returns errors array, shape (n_trials,).
     """
-    bin_edges = np.linspace(-np.pi, np.pi, n_bins + 1)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    l = len(active_locs)
+    M, n_theta = f_all[0].shape
+    errors = np.empty(n_trials)
 
-    counts, _ = np.histogram(errors, bins=bin_edges)
-    bin_width = bin_edges[1] - bin_edges[0]
-    empirical = counts / (len(errors) * bin_width)  # density
+    f_active = [f_all[loc] for loc in active_locs]
 
-    m1, _ = _circular_moments(errors)
-    rho1 = np.abs(m1)
-    kappa = _rho_to_kappa(rho1)
-    von_mises = _von_mises_pdf(bin_centers, kappa)
+    for t in range(n_trials):
+        # 1. Sample true orientation indices for all l locations
+        theta_indices = rng.randint(n_theta, size=l)
 
-    return {
-        'bin_centers': bin_centers,
-        'empirical': empirical,
-        'von_mises': von_mises,
-        'deviation': empirical - von_mises,
-        'kappa': kappa,
-    }
+        # 2. Pre-normalised response: r_i^pre = exp(Σ_k f_{i,k}(θ_k^true))
+        log_r_pre = np.zeros(M)
+        for k in range(l):
+            log_r_pre += f_active[k][:, theta_indices[k]]
+        r_pre = np.exp(log_r_pre)
+
+        # 3. Divisive normalisation (Eq. 6)
+        rates = dn_pointwise(r_pre, gamma, sigma_sq)
+
+        # 4. Poisson spikes
+        counts = generate_spikes(rates, T_d, rng)
+
+        # 5. Efficient factorised ML decode with marginalisation
+        L_list = compute_spike_weighted_log_tuning(counts, f_active)
+        ll_marginal = compute_marginal_log_likelihood_efficient(L_list, cued_index)
+        idx_hat = np.argmax(ll_marginal)
+
+        # 6. Circular error at cued location
+        errors[t] = compute_circular_error(
+            thetas[theta_indices[cued_index]], thetas[idx_hat]
+        )
+
+    return errors
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -108,7 +117,7 @@ def compute_deviation_from_normal(
 
 def run_experiment(config: Dict) -> Dict:
     """
-    Fix (λ_base, γ), sweep set sizes. DN: effective gain = γ/N.
+    Fix (λ_base, γ), sweep set sizes using FULL multi-location pipeline.
 
     Config keys
     -----------
@@ -136,19 +145,27 @@ def run_experiment(config: Dict) -> Dict:
     n_seeds    = config.get('n_seeds', 5)
     n_bins     = config.get('n_bins', 50)
 
+    max_locs = max(set_sizes)
+
     t0 = time.time()
-    all_seeds = []  # list of dicts, one per seed
+    all_seeds = []
 
     for s in range(n_seeds):
         current_seed = seed + s * 1000
-        thetas, g, log_g = _generate_population(M, n_theta, lam, current_seed)
+
+        thetas, f_all = generate_population(M, n_theta, lam, max_locs, current_seed)
 
         seed_data = {}
         for N in set_sizes:
-            effective_gamma = gamma / N  # ← DN consequence
+            print(f"  seed={s} N={N}...", end=" ", flush=True)
+
+            active_locs = tuple(range(N))
+            cued_index = 0
+
             rng = np.random.RandomState(current_seed + N)
-            errors = _run_trials_at_gain(
-                g, log_g, thetas, effective_gamma, T_d, sigma_sq, n_trials, rng
+            errors = _run_multiloc_trials(
+                f_all, thetas, active_locs, cued_index,
+                gamma, T_d, sigma_sq, n_trials, rng,
             )
             dev = compute_deviation_from_normal(errors, n_bins)
             seed_data[N] = {
@@ -157,7 +174,7 @@ def run_experiment(config: Dict) -> Dict:
                 'kurtosis': circular_kurtosis(errors),
                 'deviation': dev,
             }
-            print(f"  seed={s} N={N}: var={seed_data[N]['variance']:.4f} "
+            print(f"var={seed_data[N]['variance']:.4f} "
                   f"kurt={seed_data[N]['kurtosis']:.2f}")
 
         all_seeds.append(seed_data)
@@ -173,7 +190,6 @@ def run_experiment(config: Dict) -> Dict:
             'kurtosis_mean': np.mean(kurts_),
             'kurtosis_se':   np.std(kurts_, ddof=1) / np.sqrt(n_seeds) if n_seeds > 1 else 0,
         }
-        # Mean deviation curve (average across seeds)
         devs = np.array([sd[N]['deviation']['deviation'] for sd in all_seeds])
         emps = np.array([sd[N]['deviation']['empirical'] for sd in all_seeds])
         summary[N]['deviation_mean'] = np.mean(devs, axis=0)
@@ -198,15 +214,11 @@ def run_experiment(config: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PLOTTING — Matching Bays (2014) Fig 2 layout (model curves only)
+# PLOTTING
 # ═══════════════════════════════════════════════════════════════════════════
 
 def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
-    """
-    2-row × 5-column figure:
-        Row 1: error distributions at N=1,2,4,8  |  variance vs items
-        Row 2: deviation from normal at N=1,2,4,8 |  kurtosis vs items
-    """
+    """2-row × 5-column figure matching Bays (2014) Fig 2 layout."""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     set_sizes  = results['set_sizes']
@@ -247,7 +259,6 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
             ax.text(-0.22, 1.08, r'$\mathbf{c}$', transform=ax.transAxes,
                     fontsize=15, fontweight='bold', va='top')
 
-    # Variance vs items (log-log)
     ax_var = fig.add_subplot(gs[0, n_ss])
     ns = np.array(set_sizes, dtype=float)
     v_mean = np.array([summary[N]['variance_mean'] for N in set_sizes])
@@ -286,7 +297,6 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
             ax.text(-0.22, 1.08, r'$\mathbf{e}$', transform=ax.transAxes,
                     fontsize=15, fontweight='bold', va='top')
 
-    # Kurtosis vs items
     ax_kur = fig.add_subplot(gs[1, n_ss])
     k_mean = np.array([summary[N]['kurtosis_mean'] for N in set_sizes])
     k_se   = np.array([summary[N]['kurtosis_se'] for N in set_sizes])
@@ -313,7 +323,6 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
         plt.show()
     plt.close(fig)
 
-    # Save data
     np.savez(
         Path(output_dir) / 'figure_2_data.npz',
         set_sizes=set_sizes, bin_centers=bins,
@@ -334,5 +343,6 @@ if __name__ == '__main__':
         'set_sizes': [1, 2, 4, 8], 'seed': 42, 'n_seeds': 5,
     }
     print("Running Bays (2014) Figure 2 — GP Model Predictions")
+    print("  Decoder: Efficient factorised ML with marginalisation")
     results = run_experiment(config)
     plot_results(results, 'results/figure_2', show_plot=True)

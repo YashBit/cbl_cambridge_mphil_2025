@@ -22,7 +22,7 @@ from typing import Dict, List, Tuple, Optional
 def periodic_rbf_kernel(
     orientations: np.ndarray,
     lengthscale: float,
-    jitter: float = 1e-6
+    jitter: float = 1e-4
 ) -> np.ndarray:
     """
     Compute periodic RBF (squared exponential) kernel for circular orientation space.

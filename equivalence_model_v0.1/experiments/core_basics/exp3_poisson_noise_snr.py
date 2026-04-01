@@ -1,663 +1,389 @@
 """
-Experiment 3: Poisson Noise Analysis (v3.1 - DRY)
+Experiment 3: Poisson Noise and the 1/√l Capacity Limit
+========================================================
 
-=============================================================================
-THEORETICAL FOUNDATION
-=============================================================================
+Validates how Poisson spiking noise converts DN's rate reduction
+into the working memory capacity limit (§3.7, §4.5).
 
-This experiment demonstrates how Poisson spiking noise creates the capacity 
-limit in working memory through the 1/√l degradation of per-item precision.
+The causal chain:
+    DN caps total activity at γN  →  per-item rate = γN/l
+    →  per-item spike count λ = γN·T_d/l  →  SNR = √λ ∝ 1/√l
 
-THE KEY INSIGHT:
-----------------
-- Total population activity: Σᵢ rᵢ = γN (CONSTANT due to DN)
-- Total spikes: λ_total = γN × T_d (CONSTANT)
-- SNR of total spikes: √(λ_total) (CONSTANT) ← NOT the capacity limit!
+Three sub-experiments:
 
-What DOES degrade with set size l:
-- Per-item firing rate: r_item ≈ γN/l (decreases with l)
-- Per-item spike count: λ_item = (γN/l) × T_d (decreases with l)  
-- Per-item SNR: √(λ_item) ∝ 1/√l ← THIS is the capacity limit!
+    3A — SNR SCALING (§3.7)
+        Total SNR = √(γN·T_d) is CONSTANT across set sizes.
+        Per-item SNR = √(γN·T_d/l) DEGRADES as 1/√l.
+        This is the capacity limit.
 
-SUB-EXPERIMENTS:
-----------------
-3A: Per-Item SNR Scaling — demonstrates SNR ∝ 1/√l
-3B: Time-Accuracy Trade-off — SNR_item = √(γN × T_d / l)
-3C: Per-Item Spike Distributions — visualize resource allocation
+    3B — TIME-ACCURACY TRADE-OFF
+        Per-item SNR = √(γN·T_d/l).
+        Doubling T_d improves SNR by √2, but the 1/√l penalty
+        is fundamental — every curve follows the same shape.
 
-Author: Yash Bharti
-Date: January 2026
-Version: 3.1 (DRY - uses core module functions)
-=============================================================================
+    3C — SPIKE COUNT DISTRIBUTIONS
+        Total spike count ~ Poisson(γN·T_d) is identical for all l.
+        Per-item spike count ~ Poisson(γN·T_d/l) shifts left and
+        narrows as l increases.
+
+Paper equations:
+    Per-item rate:  r_item = γN / l                          [§4.5]
+    Expected spikes: λ_item = γN·T_d / l                     [Def. 4.5]
+    SNR: √λ = √(γN·T_d/l) ∝ 1/√l                           [§3.7]
 """
 
 import numpy as np
-import seaborn as sns
 import matplotlib.pyplot as plt
+from itertools import combinations
 from pathlib import Path
 from typing import Dict, Tuple
-from dataclasses import dataclass
-from itertools import combinations
+import time
 
-# Import from core modules (no re-implementation)
 from core.gaussian_process import generate_neuron_population
-from core.divisive_normalization import (
-    compute_total_post_dn_analytical,
-    compute_per_item_activity_efficient,
-)
-from core.poisson_spike import (
-    generate_spikes_multi_trial,
-    compute_theoretical_snr,
-)
+from core.poisson_spike import generate_spikes
+from core.divisive_normalisation import dn_pointwise, total_post_activity, per_item_activity
 
 
 # =============================================================================
-# CONFIGURATION
+# SHARED SETUP
 # =============================================================================
 
-@dataclass
-class ExpConfig:
-    """Configuration for Experiment 3."""
-    n_neurons: int = 100
-    n_orientations: int = 10
-    n_locations: int = 8
-    gamma: float = 100.0
-    sigma_sq: float = 1e-6
-    T_d: float = 0.1
-    n_trials: int = 1000
-    set_sizes: tuple = (1, 2, 4, 6, 8)
-    T_d_values: tuple = (0.05, 0.1, 0.2, 0.4)
-    lambda_base: float = 0.3
-    sigma_lambda: float = 0.5
-    seed: int = 42
-    
-    @property
-    def total_activity(self) -> float:
-        """Total population activity budget (γN)."""
-        return self.gamma * self.n_neurons
-
-
-# =============================================================================
-# HELPER: COMPUTE POST-DN RATES FOR A STIMULUS CONFIGURATION
-# =============================================================================
-
-def compute_post_dn_rates(
-    G_stacked: np.ndarray,
-    subset: Tuple[int, ...],
-    fixed_thetas: np.ndarray,
-    gamma: float,
-    sigma_sq: float
-) -> np.ndarray:
-    """
-    Compute post-DN firing rates for each neuron given a stimulus configuration.
-    
-    This implements the DN equation:
-        r^{post}_i = γ · r^{pre}_i / [σ² + (1/N) Σ_j r^{pre}_j]
-    
-    where r^{pre}_i = ∏_{k ∈ S} g_i(θ_k, k) is the pre-DN response.
-    
-    Parameters
-    ----------
-    G_stacked : np.ndarray
-        Pre-computed g(θ) = exp(f(θ)), shape (N, n_locations, n_orientations)
-    subset : Tuple[int, ...]
-        Active location indices
-    fixed_thetas : np.ndarray
-        Orientation index at each location, shape (n_locations,)
-    gamma : float
-        Gain constant
-    sigma_sq : float
-        Semi-saturation constant
-        
-    Returns
-    -------
-    R_post : np.ndarray
-        Post-DN firing rates, shape (N,)
-    """
-    N = G_stacked.shape[0]
-    
-    # Step 1: Pre-DN response (product over active locations)
-    R_pre = np.ones(N)
-    for loc in subset:
-        theta_idx = fixed_thetas[loc]
-        R_pre *= G_stacked[:, loc, theta_idx]
-    
-    # Step 2: Population divisive normalization
-    pop_mean = np.mean(R_pre)
-    R_post = gamma * R_pre / (sigma_sq + pop_mean)
-    
-    return R_post
-
-
-def generate_population_and_setup(
-    config: ExpConfig,
-    rng: np.random.Generator
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Generate GP population and sample fixed orientations.
-    
-    Returns
-    -------
-    G_stacked : np.ndarray
-        Shape (N, n_locations, n_orientations)
-    fixed_thetas : np.ndarray
-        Fixed orientation indices, shape (n_locations,)
-    """
-    # Generate neuron population using core module
+def _setup_population(config: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    """Generate GP population and fixed orientations. Returns (G_stacked, fixed_thetas)."""
     population = generate_neuron_population(
-        n_neurons=config.n_neurons,
-        n_orientations=config.n_orientations,
-        n_locations=config.n_locations,
-        base_lengthscale=config.lambda_base,
-        lengthscale_variability=config.sigma_lambda,
-        seed=config.seed
+        n_neurons=config['n_neurons'],
+        n_orientations=config['n_orientations'],
+        n_locations=config['n_locations'],
+        base_lengthscale=config['lambda_base'],
+        lengthscale_variability=config['sigma_lambda'],
+        seed=config['seed'],
     )
-    
-    # Pre-compute G = exp(f)
-    f_samples_population = [neuron['f_samples'] for neuron in population]
-    G_stacked = np.stack([np.exp(f) for f in f_samples_population], axis=0)
-    
-    # Sample fixed orientations
-    fixed_thetas = rng.integers(0, config.n_orientations, size=config.n_locations)
-    
+    G_stacked = np.stack([np.exp(n['f_samples']) for n in population])
+    rng = np.random.default_rng(config['seed'] + 1000)
+    fixed_thetas = rng.integers(0, config['n_orientations'], size=config['n_locations'])
     return G_stacked, fixed_thetas
 
 
+def _compute_rates_at_subset(G_stacked, subset, fixed_thetas, gamma, sigma_sq):
+    """
+    Compute post-DN rates at one (S, θ) configuration.
+
+        r^pre_n = ∏_{k∈S} G[n, k, θ_k]    [Eq. 13]
+        r^post = dn_pointwise(r^pre, γ, σ²) [Eq. 6]
+    """
+    N = G_stacked.shape[0]
+    R_pre = np.ones(N)
+    for loc in subset:
+        R_pre *= G_stacked[:, loc, fixed_thetas[loc]]
+    return dn_pointwise(R_pre, gamma, sigma_sq)
+
+
 # =============================================================================
-# EXPERIMENT 3A: PER-ITEM SNR SCALING
+# 3A — SNR SCALING  (§3.7)
+# =============================================================================
+#
+# Theoretical:
+#   λ_total = γN·T_d          → SNR_total = √(γN·T_d)       (constant)
+#   λ_item  = γN·T_d / l      → SNR_item  = √(γN·T_d / l)   (∝ 1/√l)
+#
+# Empirical:
+#   Generate Poisson spikes at each (S,θ), measure total and per-item
+#   spike count statistics.
 # =============================================================================
 
-def run_exp3a_snr_scaling(config: ExpConfig) -> Dict:
-    """
-    Experiment 3A: Demonstrate per-item SNR ∝ 1/√l scaling.
-    
-    Measures:
-    1. Total population SNR (constant due to DN)
-    2. Per-item SNR (degrades as 1/√l)
-    """
-    rng = np.random.default_rng(config.seed)
-    rng_poisson = np.random.RandomState(config.seed + 1000)
-    
-    G_stacked, fixed_thetas = generate_population_and_setup(config, rng)
-    
-    # Use core module for theoretical predictions
-    total_activity = compute_total_post_dn_analytical(config.gamma, config.n_neurons)
-    
-    results = {
-        'set_sizes': list(config.set_sizes),
-        'theoretical': {
-            'lambda_total': [],
-            'lambda_per_item': [],
-            'snr_total': [],
-            'snr_per_item': [],
-        },
-        'empirical': {
-            'snr_total': [],
-            'snr_per_item': [],
-            'fano_mean': [],
-            'rate_total': [],
-            'rate_per_item': [],
-        },
+def _run_3a(G_stacked, fixed_thetas, config):
+    N = config['n_neurons']
+    gamma = config['gamma']
+    sigma_sq = config['sigma_sq']
+    T_d = config['T_d']
+    set_sizes = config['set_sizes']
+    n_trials = config.get('n_trials', 1000)
+    rng = np.random.RandomState(config['seed'] + 2000)
+
+    gamma_N_Td = gamma * N * T_d  # total expected spikes (constant)
+
+    theoretical = {
+        'lambda_total': [], 'lambda_per_item': [],
+        'snr_total': [], 'snr_per_item': [],
     }
-    
-    for l in config.set_sizes:
-        # === THEORETICAL PREDICTIONS (using core module) ===
-        lambda_total = total_activity * config.T_d
-        per_item_activity = compute_per_item_activity_efficient(
-            config.gamma, config.n_neurons, l
-        )
-        lambda_per_item = per_item_activity * config.T_d
-        
-        snr_total_theory = compute_theoretical_snr(lambda_total)
-        snr_per_item_theory = compute_theoretical_snr(lambda_per_item)
-        
-        results['theoretical']['lambda_total'].append(lambda_total)
-        results['theoretical']['lambda_per_item'].append(lambda_per_item)
-        results['theoretical']['snr_total'].append(snr_total_theory)
-        results['theoretical']['snr_per_item'].append(snr_per_item_theory)
-        
-        # === EMPIRICAL MEASUREMENT ===
-        all_subsets = list(combinations(range(config.n_locations), l))
-        n_subsets = len(all_subsets)
-        
-        total_spikes_all = []
-        per_item_spikes_all = []
-        all_rates = []
-        
+    empirical = {'snr_per_item': []}
+
+    for l in set_sizes:
+        # ── Theoretical ──
+        lam_total = gamma_N_Td
+        lam_item = gamma_N_Td / l
+        theoretical['lambda_total'].append(lam_total)
+        theoretical['lambda_per_item'].append(lam_item)
+        theoretical['snr_total'].append(np.sqrt(lam_total))
+        theoretical['snr_per_item'].append(np.sqrt(lam_item))
+
+        # ── Empirical: sample spikes across subsets ──
+        all_subsets = list(combinations(range(config['n_locations']), l))
+        per_item_spikes = []
+
         for subset in all_subsets:
-            # Compute post-DN rates
-            R_post = compute_post_dn_rates(
-                G_stacked, subset, fixed_thetas,
-                config.gamma, config.sigma_sq
-            )
-            all_rates.append(R_post)
-            
-            # Generate Poisson spikes using core module
-            spike_counts = generate_spikes_multi_trial(
-                rates=R_post,
-                T_d=config.T_d,
-                n_trials=config.n_trials // n_subsets + 1,
-                rng=rng_poisson
-            )
-            
-            total_spikes = np.sum(spike_counts, axis=1)
-            total_spikes_all.extend(total_spikes)
-            per_item_spikes_all.extend(total_spikes / l)
-        
-        total_arr = np.array(total_spikes_all)
-        per_item_arr = np.array(per_item_spikes_all)
-        all_rates_arr = np.array(all_rates)
-        
-        # Empirical SNR
-        snr_total_emp = np.mean(total_arr) / np.std(total_arr) if np.std(total_arr) > 0 else 0
-        snr_per_item_emp = np.mean(per_item_arr) / np.std(per_item_arr) if np.std(per_item_arr) > 0 else 0
-        fano = np.var(total_arr) / np.mean(total_arr) if np.mean(total_arr) > 0 else 1.0
-        
-        results['empirical']['snr_total'].append(snr_total_emp)
-        results['empirical']['snr_per_item'].append(snr_per_item_emp)
-        results['empirical']['fano_mean'].append(fano)
-        results['empirical']['rate_total'].append(np.mean(np.sum(all_rates_arr, axis=1)))
-        results['empirical']['rate_per_item'].append(np.mean(np.sum(all_rates_arr, axis=1)) / l)
-    
-    return results
+            rates = _compute_rates_at_subset(G_stacked, subset, fixed_thetas, gamma, sigma_sq)
+            trials_per_subset = max(1, n_trials // len(all_subsets))
+            for _ in range(trials_per_subset):
+                spikes = generate_spikes(rates, T_d, rng)
+                per_item_spikes.append(np.sum(spikes) / l)
+
+        arr = np.array(per_item_spikes)
+        empirical['snr_per_item'].append(
+            np.mean(arr) / np.std(arr) if np.std(arr) > 0 else 0.0)
+
+    return {'theoretical': theoretical, 'empirical': empirical, 'set_sizes': set_sizes}
 
 
 # =============================================================================
-# EXPERIMENT 3B: TIME-ACCURACY TRADE-OFF
+# 3B — TIME-ACCURACY TRADE-OFF
+# =============================================================================
+#
+# Per-item SNR = √(γN·T_d / l)
+# Sweep (l, T_d) grid.  Every curve follows 1/√l; longer T_d shifts up by √T_d.
 # =============================================================================
 
-def run_exp3b_time_tradeoff(config: ExpConfig) -> Dict:
-    """
-    Experiment 3B: Time-accuracy trade-off for per-item precision.
-    
-    Per-item SNR = √(γN × T_d / l)
-    
-    Doubling T_d compensates for doubling l.
-    """
-    total_activity = compute_total_post_dn_analytical(config.gamma, config.n_neurons)
-    
-    results = {
-        'set_sizes': list(config.set_sizes),
-        'T_d_values': list(config.T_d_values),
-        'snr_total_grid': np.zeros((len(config.set_sizes), len(config.T_d_values))),
-        'snr_per_item_grid': np.zeros((len(config.set_sizes), len(config.T_d_values))),
-        'lambda_per_item_grid': np.zeros((len(config.set_sizes), len(config.T_d_values))),
-    }
-    
-    for i, l in enumerate(config.set_sizes):
-        per_item_activity = compute_per_item_activity_efficient(
-            config.gamma, config.n_neurons, l
-        )
-        
-        for j, T_d in enumerate(config.T_d_values):
-            lambda_total = total_activity * T_d
-            lambda_per_item = per_item_activity * T_d
-            
-            results['snr_total_grid'][i, j] = compute_theoretical_snr(lambda_total)
-            results['snr_per_item_grid'][i, j] = compute_theoretical_snr(lambda_per_item)
-            results['lambda_per_item_grid'][i, j] = lambda_per_item
-    
-    return results
+def _run_3b(config):
+    N = config['n_neurons']
+    gamma = config['gamma']
+    set_sizes = config['set_sizes']
+    T_d_values = config.get('T_d_values', [0.05, 0.1, 0.2, 0.4])
+
+    grid = np.zeros((len(set_sizes), len(T_d_values)))
+    for i, l in enumerate(set_sizes):
+        for j, T_d in enumerate(T_d_values):
+            grid[i, j] = np.sqrt(gamma * N * T_d / l)
+
+    return {'set_sizes': set_sizes, 'T_d_values': T_d_values, 'snr_grid': grid}
 
 
 # =============================================================================
-# EXPERIMENT 3C: SPIKE DISTRIBUTIONS
+# 3C — SPIKE COUNT DISTRIBUTIONS
+# =============================================================================
+#
+# Total spikes ~ Poisson(γN·T_d) — same for all l.
+# Per-item spikes ~ Poisson(γN·T_d/l) — shifts left with l.
 # =============================================================================
 
-def run_exp3c_spike_distributions(config: ExpConfig) -> Dict:
-    """
-    Experiment 3C: Visualize per-item spike count distributions.
-    """
-    rng = np.random.default_rng(config.seed)
-    rng_poisson = np.random.RandomState(config.seed + 3000)
-    
-    G_stacked, fixed_thetas = generate_population_and_setup(config, rng)
-    
-    selected_sizes = [2, 4, 6, 8]
-    total_activity = compute_total_post_dn_analytical(config.gamma, config.n_neurons)
-    
-    results = {
-        'set_sizes': selected_sizes,
-        'total_distributions': {},
-        'per_item_distributions': {},
-        'stats': {},
-    }
-    
-    for l in selected_sizes:
-        all_subsets = list(combinations(range(config.n_locations), l))
-        n_subsets = len(all_subsets)
-        
-        total_spikes_all = []
-        per_item_spikes_all = []
-        
+def _run_3c(G_stacked, fixed_thetas, config):
+    N = config['n_neurons']
+    gamma = config['gamma']
+    sigma_sq = config['sigma_sq']
+    T_d = config['T_d']
+    selected = [l for l in config['set_sizes'] if l >= 2][:4]
+    n_trials = config.get('n_trials', 1000)
+    rng = np.random.RandomState(config['seed'] + 3000)
+
+    distributions = {}
+    for l in selected:
+        all_subsets = list(combinations(range(config['n_locations']), l))
+        total_spikes = []
+        per_item_spikes = []
+
         for subset in all_subsets:
-            R_post = compute_post_dn_rates(
-                G_stacked, subset, fixed_thetas,
-                config.gamma, config.sigma_sq
-            )
-            
-            spike_counts = generate_spikes_multi_trial(
-                rates=R_post,
-                T_d=config.T_d,
-                n_trials=config.n_trials // n_subsets + 1,
-                rng=rng_poisson
-            )
-            
-            total_spikes = np.sum(spike_counts, axis=1)
-            total_spikes_all.extend(total_spikes)
-            per_item_spikes_all.extend(total_spikes / l)
-        
-        total_arr = np.array(total_spikes_all)
-        per_item_arr = np.array(per_item_spikes_all)
-        
-        lambda_total = total_activity * config.T_d
-        lambda_per_item = compute_per_item_activity_efficient(
-            config.gamma, config.n_neurons, l
-        ) * config.T_d
-        
-        results['total_distributions'][l] = total_arr
-        results['per_item_distributions'][l] = per_item_arr
-        results['stats'][l] = {
-            'lambda_total': lambda_total,
-            'lambda_per_item': lambda_per_item,
-            'mean_total': np.mean(total_arr),
-            'std_total': np.std(total_arr),
-            'snr_total': np.mean(total_arr) / np.std(total_arr),
-            'mean_per_item': np.mean(per_item_arr),
-            'std_per_item': np.std(per_item_arr),
-            'snr_per_item': np.mean(per_item_arr) / np.std(per_item_arr),
+            rates = _compute_rates_at_subset(G_stacked, subset, fixed_thetas, gamma, sigma_sq)
+            trials_per_subset = max(1, n_trials // len(all_subsets))
+            for _ in range(trials_per_subset):
+                spikes = generate_spikes(rates, T_d, rng)
+                s = np.sum(spikes)
+                total_spikes.append(s)
+                per_item_spikes.append(s / l)
+
+        lam_item = gamma * N * T_d / l
+        distributions[l] = {
+            'total': np.array(total_spikes),
+            'per_item': np.array(per_item_spikes),
+            'lambda_total': gamma * N * T_d,
+            'lambda_per_item': lam_item,
         }
-    
-    return results
+
+    return {'set_sizes': selected, 'distributions': distributions}
 
 
 # =============================================================================
-# MAIN EXPERIMENT RUNNER
+# MAIN EXPERIMENT
 # =============================================================================
 
 def run_experiment_3(config: Dict) -> Dict:
-    """
-    Run all sub-experiments for Experiment 3.
-    
-    Parameters
-    ----------
-    config : Dict
-        Configuration from run_experiments.py
-        
-    Returns
-    -------
-    results : Dict
-        Combined results from all sub-experiments
-    """
-    exp_config = ExpConfig(
-        n_neurons=config.get('n_neurons', 100),
-        n_orientations=config.get('n_orientations', 10),
-        n_locations=config.get('n_locations', 8),
-        gamma=config.get('gamma', 100.0),
-        sigma_sq=config.get('sigma_sq', 1e-6),
-        T_d=config.get('T_d', 0.1),
-        n_trials=config.get('n_trials', 1000),
-        set_sizes=tuple(config.get('set_sizes', [1, 2, 4, 6, 8])),
-        lambda_base=config.get('lambda_base', 0.3),
-        sigma_lambda=config.get('sigma_lambda', 0.5),
-        seed=config.get('seed', 42),
-    )
-    
+    N = config.get('n_neurons', 100)
+    gamma = config.get('gamma', 100.0)
+    T_d = config.get('T_d', 0.1)
+    config.setdefault('set_sizes', [1, 2, 4, 6, 8])
+    config.setdefault('n_locations', 8)
+    config.setdefault('lambda_base', 0.3)
+    config.setdefault('sigma_lambda', 0.5)
+    config.setdefault('n_orientations', 10)
+    config.setdefault('seed', 42)
+
     print("=" * 70)
-    print("EXPERIMENT 3: POISSON NOISE ANALYSIS (v3.1 - DRY)")
+    print("EXPERIMENT 3: POISSON NOISE — THE 1/√l CAPACITY LIMIT")
     print("=" * 70)
-    print(f"\nConfiguration:")
-    print(f"  N = {exp_config.n_neurons} neurons")
-    print(f"  γ = {exp_config.gamma} Hz/neuron")
-    print(f"  T_d = {exp_config.T_d} s")
-    print(f"  Total activity: γN = {exp_config.total_activity:.0f} Hz (CONSTANT)")
-    print(f"  Trials: {exp_config.n_trials}")
+    print(f"  N={N}  γ={gamma}  T_d={T_d}")
+    print(f"  γN·T_d = {gamma * N * T_d:.0f} total expected spikes (CONSTANT)")
     print()
-    print("KEY INSIGHT:")
-    print("  Total SNR ∝ √(γN×T_d) is CONSTANT")
-    print("  Per-item SNR ∝ √(γN×T_d/l) DEGRADES as 1/√l")
-    print()
-    
-    print("Running Experiment 3A: Per-Item SNR Scaling...")
-    results_3a = run_exp3a_snr_scaling(exp_config)
-    
-    print("Running Experiment 3B: Time-Accuracy Trade-off...")
-    results_3b = run_exp3b_time_tradeoff(exp_config)
-    
-    print("Running Experiment 3C: Per-Item Spike Distributions...")
-    results_3c = run_exp3c_spike_distributions(exp_config)
-    
-    # Print summary
+
+    G_stacked, fixed_thetas = _setup_population(config)
+
+    print("  3A: SNR scaling...")
+    r3a = _run_3a(G_stacked, fixed_thetas, config)
+    for i, l in enumerate(r3a['set_sizes']):
+        print(f"    l={l}: SNR_item={r3a['theoretical']['snr_per_item'][i]:.1f} "
+              f"(empirical: {r3a['empirical']['snr_per_item'][i]:.1f})")
+
+    print("  3B: Time-accuracy trade-off...")
+    r3b = _run_3b(config)
+
+    print("  3C: Spike distributions...")
+    r3c = _run_3c(G_stacked, fixed_thetas, config)
+
     print("\n" + "=" * 70)
-    print("RESULTS SUMMARY")
-    print("=" * 70)
-    print(f"\n{'l':<5} {'λ_total':<10} {'λ_item':<10} {'SNR_total':<12} {'SNR_item':<12}")
-    print("-" * 55)
-    
-    for i, l in enumerate(results_3a['set_sizes']):
-        print(f"{l:<5} "
-              f"{results_3a['theoretical']['lambda_total'][i]:<10.0f} "
-              f"{results_3a['theoretical']['lambda_per_item'][i]:<10.0f} "
-              f"{results_3a['theoretical']['snr_total'][i]:<12.1f} "
-              f"{results_3a['theoretical']['snr_per_item'][i]:<12.1f}")
-    
-    print("\nNote: λ_total constant, λ_item ∝ 1/l → SNR_item ∝ 1/√l")
-    print("=" * 70)
-    
-    return {
-        'config': config,
-        'exp_config': exp_config,
-        'exp3a': results_3a,
-        'exp3b': results_3b,
-        'exp3c': results_3c,
-    }
+    return {'config': config, 'exp3a': r3a, 'exp3b': r3b, 'exp3c': r3c}
 
 
 # =============================================================================
-# PLOTTING
+# PLOTTING — 3 figures (one per sub-experiment)
 # =============================================================================
 
 def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
-    """Generate all figures for Experiment 3."""
-    
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-    
-    sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
-    palette = sns.color_palette("deep")
-    
-    exp_config = results['exp_config']
+
+    plt.rcParams.update({
+        'font.family': 'sans-serif', 'font.size': 10,
+        'axes.labelsize': 12, 'axes.titlesize': 13,
+        'figure.dpi': 150, 'savefig.dpi': 300, 'savefig.bbox': 'tight',
+    })
+
+    cfg = results['config']
     r3a = results['exp3a']
     r3b = results['exp3b']
     r3c = results['exp3c']
-    set_sizes = r3a['set_sizes']
-    
-    # =========================================================================
-    # Figure 1: SNR Scaling (Experiment 3A)
-    # =========================================================================
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    
-    # Panel A: Total vs Per-Item SNR
-    ax = axes[0]
-    ax.plot(set_sizes, r3a['theoretical']['snr_total'], 'o-', 
-            color=palette[0], linewidth=2.5, markersize=10, label='Total SNR (constant)')
-    ax.plot(set_sizes, r3a['theoretical']['snr_per_item'], 's-', 
-            color=palette[3], linewidth=2.5, markersize=10, label='Per-item SNR ∝ 1/√l')
-    ax.plot(set_sizes, r3a['empirical']['snr_per_item'], 'x', 
-            color=palette[3], markersize=12, markeredgewidth=2, label='Per-item (empirical)')
-    ax.set_xlabel('Set Size (l)')
-    ax.set_ylabel('Signal-to-Noise Ratio')
-    ax.set_title('A. The Capacity Limit: Per-Item SNR Degrades')
-    ax.legend()
-    ax.set_xticks(set_sizes)
-    sns.despine(ax=ax)
-    
-    # Panel B: Lambda comparison
-    ax = axes[1]
-    x = np.arange(len(set_sizes))
-    width = 0.35
-    ax.bar(x - width/2, r3a['theoretical']['lambda_total'], width, 
-           color=palette[0], alpha=0.7, label='λ_total', edgecolor='black')
-    ax.bar(x + width/2, r3a['theoretical']['lambda_per_item'], width,
-           color=palette[3], alpha=0.7, label='λ_per_item', edgecolor='black')
-    ax.set_xlabel('Set Size (l)')
-    ax.set_ylabel('Expected Spike Count (λ)')
-    ax.set_title('B. Resource Allocation')
-    ax.set_xticks(x)
-    ax.set_xticklabels(set_sizes)
-    ax.legend()
-    sns.despine(ax=ax)
-    
-    plt.tight_layout()
-    plt.savefig(output_path / 'exp3a_snr_scaling.png', dpi=150, bbox_inches='tight')
-    if show_plot:
-        plt.show()
-    plt.close()
-    print(f"  ✓ Saved: exp3a_snr_scaling.png")
-    
-    # =========================================================================
-    # Figure 2: Time-Accuracy Trade-off (Experiment 3B)
-    # =========================================================================
-    fig, ax = plt.subplots(figsize=(8, 6))
-    
-    colors = sns.color_palette("viridis", len(r3b['T_d_values']))
+    N = cfg['n_neurons']
+
+    # ================================================================
+    # PLOT 1: SNR scaling (3A) — the core capacity limit result
+    # ================================================================
+    fig1, (ax1a, ax1b) = plt.subplots(1, 2, figsize=(12, 5))
+    ss = r3a['set_sizes']
+
+    # Left: Total vs per-item SNR
+    ax1a.plot(ss, r3a['theoretical']['snr_total'], 'o-', color='#2E86AB',
+              lw=2, ms=8, label='Total SNR (constant)')
+    ax1a.plot(ss, r3a['theoretical']['snr_per_item'], 's-', color='#E74C3C',
+              lw=2, ms=8, label=r'Per-item SNR $\propto 1/\sqrt{l}$')
+    ax1a.plot(ss, r3a['empirical']['snr_per_item'], 'x', color='#E74C3C',
+              ms=10, mew=2, label='Per-item (empirical)')
+    ax1a.fill_between(ss, r3a['theoretical']['snr_per_item'],
+                      r3a['theoretical']['snr_total'], alpha=0.15, color='red')
+    ax1a.set_xlabel('Set size $l$')
+    ax1a.set_ylabel('SNR')
+    ax1a.set_title('A. The Capacity Limit')
+    ax1a.set_xticks(ss)
+    ax1a.legend(fontsize=9)
+
+    ax1a.text(0.98, 0.02,
+              "§3.7: SNR = √λ\n"
+              "Per-item λ = γN·T_d/l\n"
+              "→ SNR ∝ 1/√l",
+              transform=ax1a.transAxes, fontsize=9, va='bottom', ha='right',
+              bbox=dict(boxstyle='round,pad=0.4', fc='#FADBD8', ec='#E74C3C', alpha=0.9))
+
+    # Right: Resource allocation bars
+    x = np.arange(len(ss))
+    ax1b.bar(x - 0.18, r3a['theoretical']['lambda_total'], 0.35,
+             color='#2E86AB', alpha=0.7, label='λ_total', edgecolor='black', lw=0.5)
+    ax1b.bar(x + 0.18, r3a['theoretical']['lambda_per_item'], 0.35,
+             color='#E74C3C', alpha=0.7, label='λ_per_item', edgecolor='black', lw=0.5)
+    ax1b.set_xlabel('Set size $l$')
+    ax1b.set_ylabel('Expected spike count (λ)')
+    ax1b.set_title('B. Resource Allocation')
+    ax1b.set_xticks(x)
+    ax1b.set_xticklabels(ss)
+    ax1b.legend(fontsize=9)
+
+    fig1.tight_layout()
+    fig1.savefig(output_path / 'exp3_snr_scaling.png')
+    print(f"  Saved: exp3_snr_scaling.png")
+    if show_plot: plt.show()
+    plt.close(fig1)
+
+    # ================================================================
+    # PLOT 2: Time-accuracy trade-off (3B)
+    # ================================================================
+    fig2, ax2 = plt.subplots(figsize=(8, 5.5))
+    colors = plt.cm.viridis(np.linspace(0.2, 0.9, len(r3b['T_d_values'])))
+
     for j, T_d in enumerate(r3b['T_d_values']):
-        ax.plot(r3b['set_sizes'], r3b['snr_per_item_grid'][:, j], 'o-', 
-                color=colors[j], linewidth=2.5, markersize=8, label=f'T_d = {T_d:.2f}s')
-    
-    ax.set_xlabel('Set Size (l)')
-    ax.set_ylabel('Per-Item SNR')
-    ax.set_title('Time-Accuracy Trade-off: Per-Item SNR = √(γN × T_d / l)')
-    ax.legend(title='Integration Time')
-    ax.set_xticks(r3b['set_sizes'])
-    sns.despine()
-    
-    plt.tight_layout()
-    plt.savefig(output_path / 'exp3b_time_tradeoff.png', dpi=150, bbox_inches='tight')
-    if show_plot:
-        plt.show()
-    plt.close()
-    print(f"  ✓ Saved: exp3b_time_tradeoff.png")
-    
-    # =========================================================================
-    # Figure 3: Spike Distributions (Experiment 3C)
-    # =========================================================================
-    n_sizes = len(r3c['set_sizes'])
-    fig, axes = plt.subplots(2, n_sizes, figsize=(4*n_sizes, 7))
-    colors = sns.color_palette("coolwarm", n_sizes)
-    
+        ax2.plot(r3b['set_sizes'], r3b['snr_grid'][:, j], 'o-',
+                 color=colors[j], lw=2, ms=7, label=f'T_d = {T_d:.2f}s')
+
+    ax2.set_xlabel('Set size $l$')
+    ax2.set_ylabel('Per-item SNR')
+    ax2.set_title(r'Time-Accuracy Trade-off: SNR = $\sqrt{\gamma N \cdot T_d / l}$')
+    ax2.set_xticks(r3b['set_sizes'])
+    ax2.legend(title='Integration time', fontsize=9)
+
+    ax2.text(0.98, 0.98,
+             "Doubling T_d → SNR × √2\n"
+             "But every curve follows\n"
+             "1/√l — the penalty is\n"
+             "fundamental.",
+             transform=ax2.transAxes, fontsize=9, va='top', ha='right',
+             bbox=dict(boxstyle='round,pad=0.4', fc='#EBF5FB', ec='#3498DB', alpha=0.9))
+
+    fig2.tight_layout()
+    fig2.savefig(output_path / 'exp3_time_tradeoff.png')
+    print(f"  Saved: exp3_time_tradeoff.png")
+    if show_plot: plt.show()
+    plt.close(fig2)
+
+    # ================================================================
+    # PLOT 3: Spike distributions (3C)
+    # ================================================================
+    n_sz = len(r3c['set_sizes'])
+    fig3, axes = plt.subplots(2, n_sz, figsize=(4 * n_sz, 6.5))
+    colors_dist = plt.cm.coolwarm(np.linspace(0.2, 0.8, n_sz))
+
     for i, l in enumerate(r3c['set_sizes']):
-        stats = r3c['stats'][l]
-        
-        # Top: Total spikes
-        ax = axes[0, i]
-        sns.histplot(r3c['total_distributions'][l], kde=True, ax=ax, 
-                     color='gray', stat='density', alpha=0.6)
-        ax.axvline(stats['mean_total'], color='red', linestyle='--', linewidth=2)
-        ax.set_xlabel('Total Spike Count')
-        ax.set_title(f'l={l}: Total (λ={stats["lambda_total"]:.0f})')
-        
-        # Bottom: Per-item spikes
-        ax = axes[1, i]
-        sns.histplot(r3c['per_item_distributions'][l], kde=True, ax=ax, 
-                     color=colors[i], stat='density', alpha=0.6)
-        ax.axvline(stats['mean_per_item'], color='red', linestyle='--', linewidth=2)
-        ax.set_xlabel('Per-Item Spike Count')
-        ax.set_title(f'l={l}: Per-Item (λ={stats["lambda_per_item"]:.0f})')
-    
-    plt.suptitle('Exp 3C: Total (constant) vs Per-Item (decreasing) Spike Distributions',
-                 fontsize=12, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(output_path / 'exp3c_distributions.png', dpi=150, bbox_inches='tight')
-    if show_plot:
-        plt.show()
-    plt.close()
-    print(f"  ✓ Saved: exp3c_distributions.png")
-    
-    # =========================================================================
-    # Figure 4: Summary
-    # =========================================================================
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # A: Core result
-    ax = axes[0, 0]
-    ax.plot(set_sizes, r3a['theoretical']['snr_total'], 'o-', 
-            color=palette[0], linewidth=3, markersize=10, label='Total SNR')
-    ax.plot(set_sizes, r3a['theoretical']['snr_per_item'], 's-', 
-            color=palette[3], linewidth=3, markersize=10, label='Per-item SNR')
-    ax.fill_between(set_sizes, r3a['theoretical']['snr_per_item'],
-                    r3a['theoretical']['snr_total'], alpha=0.2, color='red')
-    ax.set_xlabel('Set Size (l)')
-    ax.set_ylabel('SNR')
-    ax.set_title('A. THE CAPACITY LIMIT', fontweight='bold')
-    ax.legend()
-    ax.set_xticks(set_sizes)
-    
-    # B: Resource allocation
-    ax = axes[0, 1]
-    x = np.arange(len(set_sizes))
-    ax.bar(x - 0.2, r3a['theoretical']['lambda_total'], 0.4, 
-           color=palette[0], alpha=0.7, label='λ_total')
-    ax.bar(x + 0.2, r3a['theoretical']['lambda_per_item'], 0.4,
-           color=palette[3], alpha=0.7, label='λ_per_item')
-    ax.set_xlabel('Set Size (l)')
-    ax.set_ylabel('Expected Spikes')
-    ax.set_title('B. RESOURCE ALLOCATION', fontweight='bold')
-    ax.set_xticks(x)
-    ax.set_xticklabels(set_sizes)
-    ax.legend()
-    
-    # C: Time trade-off
-    ax = axes[1, 0]
-    for j, T_d in enumerate(r3b['T_d_values']):
-        ax.plot(r3b['set_sizes'], r3b['snr_per_item_grid'][:, j], 'o-', 
-                linewidth=2, markersize=7, label=f'T_d={T_d:.2f}s')
-    ax.set_xlabel('Set Size (l)')
-    ax.set_ylabel('Per-Item SNR')
-    ax.set_title('C. TIME-ACCURACY TRADE-OFF', fontweight='bold')
-    ax.legend()
-    ax.set_xticks(r3b['set_sizes'])
-    
-    # D: Distribution comparison
-    ax = axes[1, 1]
-    for i, l in enumerate(r3c['set_sizes']):
-        data = r3c['per_item_distributions'][l]
-        data_norm = (data - np.mean(data)) / np.std(data)
-        sns.kdeplot(data_norm, ax=ax, label=f'l={l}', linewidth=2)
-    ax.set_xlabel('Normalized Per-Item Spikes')
-    ax.set_ylabel('Density')
-    ax.set_title('D. PER-ITEM DISTRIBUTIONS', fontweight='bold')
-    ax.legend()
-    
-    plt.suptitle(f'Experiment 3: The 1/√l Capacity Limit\n'
-                 f'(N={exp_config.n_neurons}, γ={exp_config.gamma} Hz, T_d={exp_config.T_d}s)',
-                 fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(output_path / 'exp3_summary.png', dpi=150, bbox_inches='tight')
-    if show_plot:
-        plt.show()
-    plt.close()
-    print(f"  ✓ Saved: exp3_summary.png")
+        d = r3c['distributions'][l]
+
+        # Top: total spikes (same for all l)
+        ax_t = axes[0, i]
+        ax_t.hist(d['total'], bins=30, density=True, color='gray', alpha=0.6, edgecolor='white')
+        ax_t.axvline(d['lambda_total'], color='red', ls='--', lw=1.5)
+        ax_t.set_title(f'l={l}: Total (λ={d["lambda_total"]:.0f})', fontsize=10)
+        if i == 0: ax_t.set_ylabel('Density')
+
+        # Bottom: per-item spikes (shifts left)
+        ax_b = axes[1, i]
+        ax_b.hist(d['per_item'], bins=30, density=True, color=colors_dist[i],
+                  alpha=0.6, edgecolor='white')
+        ax_b.axvline(d['lambda_per_item'], color='red', ls='--', lw=1.5)
+        ax_b.set_title(f'l={l}: Per-item (λ={d["lambda_per_item"]:.0f})', fontsize=10)
+        ax_b.set_xlabel('Spike count')
+        if i == 0: ax_b.set_ylabel('Density')
+
+    fig3.suptitle('Total (constant) vs Per-Item (decreasing) Spike Distributions',
+                  fontsize=12, fontweight='bold')
+    fig3.tight_layout()
+    fig3.savefig(output_path / 'exp3_distributions.png')
+    print(f"  Saved: exp3_distributions.png")
+    if show_plot: plt.show()
+    plt.close(fig3)
+
+    print(f"\n  Experiment 3 plots saved to {output_path}")
 
 
 # =============================================================================
-# STANDALONE ENTRY POINT
+# CLI
 # =============================================================================
 
 if __name__ == '__main__':
     config = {
-        'n_neurons': 100,
-        'n_orientations': 10,
-        'n_locations': 8,
-        'gamma': 100.0,
-        'sigma_sq': 1e-6,
-        'T_d': 0.1,
-        'n_trials': 1000,
-        'seed': 42,
-        'set_sizes': [1, 2, 4, 6, 8],
-        'lambda_base': 0.3,
-        'sigma_lambda': 0.5,
+        'n_neurons': 100, 'n_orientations': 10, 'n_locations': 8,
+        'gamma': 100.0, 'sigma_sq': 1e-6, 'T_d': 0.1,
+        'n_trials': 1000, 'set_sizes': [1, 2, 4, 6, 8],
+        'lambda_base': 0.3, 'sigma_lambda': 0.5, 'seed': 42,
     }
-    
     results = run_experiment_3(config)
     plot_results(results, 'results/exp3', show_plot=True)

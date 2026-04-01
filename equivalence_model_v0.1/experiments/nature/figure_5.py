@@ -40,14 +40,19 @@ PIPELINE (per set size, per trial)
 
     1. Generate M neurons with GP tuning (lengthscale = λ_base)
     2. DN: effective gain = γ / N  (set size N divides gain)
-    3. r_i(θ) = (γ/N) · g_i(θ) / (σ² + M⁻¹ Σ_j g_j(θ))
+    3. r_i(θ) = (γ/N) · g_i(θ) / (σ² + M⁻¹ Σ_j g_j(θ))   [dn_pointwise]
     4. Spike counts: n_i ~ Poisson(r_i · T_d)
-    5. ML decode: θ̂ = argmax_θ Σ_i n_i · log g_i(θ)
+    5. Full Poisson ML decode (rate-penalty retained)
     6. Circular error: ε = θ̂ − θ_true (wrapped to [-π, π))
+
+Note: This is the single-location decoder with the γ/N shortcut,
+matching the design choice in the Bays (2014) figure_1 and figure_5
+experiments.  This is a different paper from Bays (2014) and does NOT
+share utilities with the bays_equivalence experiment family.
 
 =============================================================================
 Usage:
-    from experiments.bays_equivalence.figure_5 import run_experiment, plot_results
+    from experiments.nature.figure_5 import run_experiment, plot_results
     results = run_experiment(config)
     plot_results(results, output_dir)
 =============================================================================
@@ -57,70 +62,116 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 import time
 
-# ── Core module imports (DRY: reuse existing code) ──
-from core.gaussian_process import periodic_rbf_kernel, sample_gp_function
-from core.poisson_spike import generate_spikes
-from core.ml_decoder import compute_circular_error
-
-# ── Shared utilities from figure_1 (DRY) ──
-from experiments.bays_equivalence.figure_1 import (
-    _generate_population,
-    _run_trials_at_gain,
-    circular_variance,
-)
+from core.encoder.gaussian_process import periodic_rbf_kernel, sample_gp_function
+from core.encoder.poisson_spike import generate_spikes
+from core.encoder.divisive_normalization import dn_pointwise
+from core.decoder.ml_decoder import compute_log_likelihood, compute_circular_error
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CIRCULAR SD (degrees) — the key statistic for Figure 5
-# ═══════════════════════════════════════════════════════════════════════════
 
-def circular_sd_degrees(errors: np.ndarray) -> float:
+# =============================================================================
+# CIRCULAR STATISTICS (self-contained — not shared with bays_equivalence)
+# =============================================================================
+
+def _circular_variance(errors: np.ndarray) -> float:
+    """σ² = −2·log(ρ₁) where ρ₁ = |mean(exp(iε))|."""
+    m1 = np.mean(np.exp(1j * errors))
+    rho1 = np.clip(np.abs(m1), 1e-15, 1.0 - 1e-10)
+    return -2.0 * np.log(rho1)
+
+
+def _circular_sd_degrees(errors: np.ndarray) -> float:
+    """Circular SD in degrees: √(variance) converted from radians."""
+    return np.degrees(np.sqrt(_circular_variance(errors)))
+
+
+# =============================================================================
+# POPULATION GENERATION (self-contained)
+# =============================================================================
+
+def _generate_population(
+    M: int, n_theta: int, lengthscale: float, seed: int
+) -> Tuple:
     """
-    Compute circular standard deviation in degrees.
+    Generate M neurons with GP tuning curves at a single lengthscale.
 
-    SD = sqrt(variance) where variance = -2 log(ρ₁),
-    then convert radians → degrees.
+    Returns (thetas, g) where g = exp(f), shape (M, n_theta).
     """
-    var = circular_variance(errors)
-    return np.degrees(np.sqrt(var))
+    rng = np.random.RandomState(seed)
+    thetas = np.linspace(-np.pi, np.pi, n_theta, endpoint=False)
+    K = periodic_rbf_kernel(thetas, lengthscale)
+
+    g = np.zeros((M, n_theta))
+    for i in range(M):
+        g[i] = np.exp(sample_gp_function(K, rng))
+
+    return thetas, g
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# TRIAL ENGINE — SINGLE-LOCATION, FULL POISSON ML DECODER
+# =============================================================================
+
+def _run_trials_at_gain(
+    g: np.ndarray,
+    thetas: np.ndarray,
+    gamma: float,
+    T_d: float,
+    sigma_sq: float,
+    n_trials: int,
+    rng: np.random.RandomState,
+) -> np.ndarray:
+    """
+    Run n_trials of encode → spike → decode at fixed gain γ.
+
+    Uses full Poisson ML decoder (rate-penalty retained) and
+    dn_pointwise for divisive normalisation.
+
+    Returns errors array, shape (n_trials,).
+    """
+    M, n_theta = g.shape
+    errors = np.empty(n_trials)
+
+    for t in range(n_trials):
+        idx_true = rng.randint(n_theta)
+
+        # DN at true orientation
+        rates = dn_pointwise(g[:, idx_true], gamma, sigma_sq)
+
+        # Poisson spikes
+        counts = generate_spikes(rates, T_d, rng)
+
+        # Full Poisson ML decode (rate-penalty term retained)
+        ll = compute_log_likelihood(counts, g, T_d)
+        idx_hat = np.argmax(ll)
+
+        errors[t] = compute_circular_error(thetas[idx_true], thetas[idx_hat])
+
+    return errors
+
+
+# =============================================================================
 # THEORETICAL PREDICTION
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
-def compute_theoretical_sd(
+def _compute_theoretical_sd(
     sd_at_1: float,
     set_sizes: np.ndarray,
 ) -> np.ndarray:
     """
     Theoretical SD under DN activity cap: SD(l) = SD(1) × √l.
 
-    Under DN, per-item gain scales as γN/l, so expected spikes ∝ 1/l.
-    For Poisson-limited ML decoding, Fisher information ∝ spikes ∝ 1/l,
-    so variance ∝ l and SD ∝ √l.
-
-    Parameters
-    ----------
-    sd_at_1 : float
-        Observed SD at set size 1 (used to anchor the curve)
-    set_sizes : array-like
-        Set sizes to predict
-
-    Returns
-    -------
-    theoretical_sd : np.ndarray
-        Predicted SD at each set size (same units as sd_at_1)
+    Under DN, per-item gain ∝ 1/l → Fisher info ∝ 1/l → SD ∝ √l.
     """
     return sd_at_1 * np.sqrt(np.asarray(set_sizes, dtype=float))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # MAIN EXPERIMENT
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def run_experiment(config: Dict) -> Dict:
     """
@@ -153,23 +204,23 @@ def run_experiment(config: Dict) -> Dict:
     n_bins     = config.get('n_bins', 60)
 
     t0 = time.time()
-    all_seeds = []  # list of dicts, one per seed
+    all_seeds = []
 
     for s in range(n_seeds):
         current_seed = seed + s * 1000
-        thetas, g, log_g = _generate_population(M, n_theta, lam, current_seed)
+        thetas, g = _generate_population(M, n_theta, lam, current_seed)
 
         seed_data = {}
         for N in set_sizes:
             effective_gamma = gamma / N  # DN: gain divided by set size
             rng = np.random.RandomState(current_seed + N)
             errors = _run_trials_at_gain(
-                g, log_g, thetas, effective_gamma, T_d, sigma_sq, n_trials, rng
+                g, thetas, effective_gamma, T_d, sigma_sq, n_trials, rng
             )
             seed_data[N] = {
                 'errors': errors,
-                'sd_deg': circular_sd_degrees(errors),
-                'variance': circular_variance(errors),
+                'sd_deg': _circular_sd_degrees(errors),
+                'variance': _circular_variance(errors),
             }
             print(f"  seed={s} N={N}: SD={seed_data[N]['sd_deg']:.2f}°")
 
@@ -194,19 +245,17 @@ def run_experiment(config: Dict) -> Dict:
             all_errors.append(seed_data[N]['errors'])
     pooled_errors = np.concatenate(all_errors)
 
-    # Histogram of pooled errors
     bin_edges = np.linspace(-np.pi, np.pi, n_bins + 1)
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
     counts, _ = np.histogram(pooled_errors, bins=bin_edges)
     bin_width = bin_edges[1] - bin_edges[0]
     pooled_density = counts / (len(pooled_errors) * bin_width)
 
-    # Pooled actual SD
-    pooled_sd_deg = circular_sd_degrees(pooled_errors)
+    pooled_sd_deg = _circular_sd_degrees(pooled_errors)
 
     # ── Theoretical √l prediction ──
     sd_at_1 = summary[set_sizes[0]]['sd_mean']
-    theoretical_sd = compute_theoretical_sd(sd_at_1, np.array(set_sizes))
+    theoretical_sd = _compute_theoretical_sd(sd_at_1, np.array(set_sizes))
 
     elapsed = time.time() - t0
     print(f"\n  Done in {elapsed:.1f}s ({n_seeds} seeds × {len(set_sizes)} set sizes "
@@ -227,9 +276,9 @@ def run_experiment(config: Dict) -> Dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # PLOTTING — Three-panel figure matching Figure 5 layout
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     """
@@ -271,21 +320,17 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     BLUE = '#2255AA'
     GRAY_HIST = '#AAAAAA'
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Panel (a): Pooled error distribution
-    # ══════════════════════════════════════════════════════════════════════
+    # ── Panel (a): Pooled error distribution ──
     ax_a = fig.add_subplot(gs[0])
 
-    # Histogram (gray bars, matching original figure style)
     bin_width = bins[1] - bins[0]
     ax_a.bar(np.degrees(bins), pooled_density * np.pi / 180,
              width=np.degrees(bin_width) * 0.85,
              color=GRAY_HIST, edgecolor='#888888', linewidth=0.3,
              alpha=0.7, zorder=2)
 
-    # Annotate actual SD
     ax_a.annotate(
-        f'Actual SD = {pooled_sd:.1f}°',
+        f'Actual SD = {pooled_sd:.1f}\u00b0',
         xy=(0.97, 0.95), xycoords='axes fraction',
         fontsize=9, ha='right', va='top',
         bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
@@ -300,9 +345,7 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     ax_a.text(-0.14, 1.06, r'$\mathbf{a}$', transform=ax_a.transAxes,
               fontsize=15, fontweight='bold', va='top')
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Panel (b): Actual SD vs set size
-    # ══════════════════════════════════════════════════════════════════════
+    # ── Panel (b): Actual SD vs set size ──
     ax_b = fig.add_subplot(gs[1])
 
     ax_b.errorbar(ns, sd_mean, yerr=sd_se,
@@ -320,12 +363,9 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     ax_b.text(-0.14, 1.06, r'$\mathbf{b}$', transform=ax_b.transAxes,
               fontsize=15, fontweight='bold', va='top')
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Panel (c): Model vs theoretical √l prediction
-    # ══════════════════════════════════════════════════════════════════════
+    # ── Panel (c): Model vs theoretical √l prediction ──
     ax_c = fig.add_subplot(gs[2])
 
-    # Model data with SE bands
     ax_c.plot(ns, sd_mean, 'o-', color=RED, linewidth=1.5, markersize=5,
               zorder=3, label='GP model')
     ax_c.fill_between(ns, sd_mean - sd_se, sd_mean + sd_se,
@@ -333,7 +373,6 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     ax_c.plot(ns, sd_mean - sd_se, '--', color=RED, linewidth=0.6, alpha=0.5)
     ax_c.plot(ns, sd_mean + sd_se, '--', color=RED, linewidth=0.6, alpha=0.5)
 
-    # Theoretical √l curve
     ns_smooth = np.linspace(1, 8, 100)
     sd_at_1 = summary[set_sizes[0]]['sd_mean']
     theoretical_smooth = sd_at_1 * np.sqrt(ns_smooth)
@@ -356,12 +395,11 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     gam = config.get('gamma', '?')
     M   = config.get('M', '?')
     fig.suptitle(
-        f'GP Population Coding — Figure 5 Equivalent '
+        f'GP Population Coding \u2014 Bays & Brady (2024) Fig 5 Equivalent '
         f'($\\lambda$={lam}, $\\gamma$={gam} Hz, M={M})',
         fontsize=12, fontweight='bold', y=0.97,
     )
 
-    # ── Save ──
     outpath = Path(output_dir) / 'figure_5_sd_vs_setsize.png'
     fig.savefig(outpath, dpi=300)
     print(f"  Saved: {outpath}")
@@ -369,7 +407,6 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
         plt.show()
     plt.close(fig)
 
-    # Save data
     np.savez(
         Path(output_dir) / 'figure_5_data.npz',
         set_sizes=np.array(set_sizes),
@@ -381,9 +418,9 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # STANDALONE
-# ═══════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 if __name__ == '__main__':
     config = {
@@ -393,8 +430,8 @@ if __name__ == '__main__':
         'set_sizes': [1, 2, 3, 4, 5, 6, 7, 8],
         'seed': 42, 'n_seeds': 5,
     }
-    print("Running Bays & Brady (2024) Figure 5 — GP Model: SD vs Set Size")
+    print("Running Bays & Brady (2024) Figure 5 \u2014 GP Model: SD vs Set Size")
     print(f"  Set sizes: {config['set_sizes']}, Trials: {config['n_trials']}, "
           f"Neurons: {config['M']}, Seeds: {config['n_seeds']}")
     results = run_experiment(config)
-    plot_results(results, 'results/figure_5', show_plot=True)
+    plot_results(results, 'results/nature_figure_5', show_plot=True)

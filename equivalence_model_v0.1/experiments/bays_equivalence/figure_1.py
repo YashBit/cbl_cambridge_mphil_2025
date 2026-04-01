@@ -4,21 +4,28 @@ Bays (2014) Figure 1 d,e,f — GP-Based Equivalent
 Recreates panels d (variance), e (kurtosis), f (power-law exponent)
 using Gaussian Process tuning curves instead of von Mises.
 
+=============================================================================
+KEY DESIGN CHOICE: FULL POISSON ML DECODER (SINGLE-LOCATION)
+=============================================================================
+
+For GP tuning curves the population does NOT tile uniformly, so
+Σ_i g_i(θ) fluctuates across θ.  We therefore use the FULL Poisson
+log-likelihood (retaining the rate-penalty term):
+
+    θ̂ = argmax_θ  Σ_i [ n_i · log g_i(θ) − g_i(θ) · T_d ]
+
+This is the correct single-location ML decoder for our generative model.
+
 Pipeline per (λ_base, γ) grid point:
     1. Generate M neurons with GP tuning (lengthscale = λ_base)
     2. For each trial:
        a. Sample true orientation θ_true
-       b. Compute firing rates via DN:  r_i = γ · g_i(θ) / (σ² + M⁻¹ Σ_j g_j(θ))
-       c. Generate Poisson spikes:      n_i ~ Poisson(r_i · T_d)
-       d. ML decode:                    θ̂ = argmax_θ Σ_i n_i · log g_i(θ)
-       e. Record circular error:        ε = θ̂ − θ (wrapped to [-π, π))
-    3. Compute circular variance, kurtosis from errors
+       b. DN:  r_i = γ · g_i(θ) / (σ² + M⁻¹ Σ_j g_j(θ))   [dn_pointwise]
+       c. Poisson spikes: n_i ~ Poisson(r_i · T_d)
+       d. Full ML decode
+       e. Record circular error
+    3. Compute circular variance, kurtosis
     4. Exponent: α = log₂(V(γ) / V(γ/2))
-
-Circular statistics (Fisher, 1995; Bays 2014):
-    m_n = mean(exp(i·n·ε))             nth trigonometric moment
-    variance = −2·log|m_1|             circular variance (= squared circ. SD)
-    kurtosis = (ρ₂·cos(μ₂ − 2μ₁) − ρ₁⁴) / (1 − ρ₁)²
 
 Usage:
     from experiments.bays_equivalence.figure_1 import run_experiment, plot_results
@@ -30,81 +37,26 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 import time
 
-# ── Core module imports (DRY: no function redefinition) ──
-from core.gaussian_process import (
-    periodic_rbf_kernel,
-    sample_gp_function,
+from core.encoder.poisson_spike import generate_spikes
+from core.encoder.divisive_normalization import dn_pointwise
+from core.decoder.ml_decoder import compute_log_likelihood, compute_circular_error
+
+from experiments.bays_equivalence.bays_utils import (
+    circular_variance,
+    circular_kurtosis,
+    generate_population,
 )
-from core.poisson_spike import generate_spikes
-from core.ml_decoder import compute_circular_error
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CIRCULAR STATISTICS (Bays 2014 definitions, not in core modules)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _circular_moments(errors: np.ndarray) -> Tuple[complex, complex]:
-    """1st and 2nd uncentered trigonometric moments."""
-    return np.mean(np.exp(1j * errors)), np.mean(np.exp(2j * errors))
-
-
-def circular_variance(errors: np.ndarray) -> float:
-    """σ² = −2·log(ρ₁). (Fisher 1995; Bays 2014 Methods)"""
-    m1, _ = _circular_moments(errors)
-    rho1 = np.clip(np.abs(m1), 1e-15, 1.0 - 1e-10)
-    return -2.0 * np.log(rho1)
-
-
-def circular_kurtosis(errors: np.ndarray) -> float:
-    """κ = (ρ₂·cos(μ₂ − 2μ₁) − ρ₁⁴) / (1 − ρ₁)². (Fisher 1995; Bays 2014)"""
-    m1, m2 = _circular_moments(errors)
-    rho1, rho2 = np.abs(m1), np.abs(m2)
-    mu1, mu2 = np.angle(m1), np.angle(m2)
-    denom = (1.0 - rho1) ** 2
-    if denom < 1e-15:
-        return 0.0
-    return (rho2 * np.cos(mu2 - 2 * mu1) - rho1 ** 4) / denom
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# POPULATION GENERATION (thin wrapper around core GP functions)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def _generate_population(
-    M: int, n_theta: int, lengthscale: float, seed: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Generate M neurons with GP tuning curves at a single lengthscale.
-
-    Returns
-    -------
-    thetas : (n_theta,)
-    g      : (M, n_theta) — driving inputs exp(f(θ))
-    log_g  : (M, n_theta) — log driving inputs (for ML decoding)
-    """
-    rng = np.random.RandomState(seed)
-    thetas = np.linspace(-np.pi, np.pi, n_theta, endpoint=False)
-    K = periodic_rbf_kernel(thetas, lengthscale)
-
-    f = np.zeros((M, n_theta))
-    for i in range(M):
-        f[i] = sample_gp_function(K, rng)
-
-    g = np.exp(f)
-    log_g = np.log(np.maximum(g, 1e-20))
-    return thetas, g, log_g
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TRIAL ENGINE
+# TRIAL ENGINE — SINGLE-LOCATION, FULL POISSON ML DECODER
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _run_trials_at_gain(
     g: np.ndarray,
-    log_g: np.ndarray,
     thetas: np.ndarray,
     gamma: float,
     T_d: float,
@@ -115,9 +67,16 @@ def _run_trials_at_gain(
     """
     Run n_trials of encode → spike → decode at fixed gain γ.
 
-    DN equation:  r_i(θ) = γ · g_i(θ) / (σ² + M⁻¹ Σ_j g_j(θ))
-    ML decode:    θ̂ = argmax_θ  Σ_i n_i · log g_i(θ)
-                  (constant DN term drops out — see ml_decoder.py Property 1)
+    DN equation (Eq. 6, single-location case):
+        r_i(θ) = γ · g_i(θ) / (σ² + M⁻¹ Σ_j g_j(θ))
+
+    Full Poisson ML decode (NOT Bays's simplified version):
+        θ̂ = argmax_θ  Σ_i [ n_i · log g_i(θ)  −  g_i(θ) · T_d ]
+
+    We decode using the DRIVING INPUTS g_i(θ), not the normalised rates.
+    This is valid because the DN denominator is the same for all neurons
+    at a given θ, so the γ and denominator terms factor out or cancel
+    in the argmax.
 
     Returns errors array, shape (n_trials,).
     """
@@ -125,22 +84,18 @@ def _run_trials_at_gain(
     errors = np.empty(n_trials)
 
     for t in range(n_trials):
-        # 1. Random true stimulus index
         idx_true = rng.randint(n_theta)
 
-        # 2. Firing rates at true orientation with DN
-        g_true = g[:, idx_true]                          # (M,)
-        denom = sigma_sq + np.mean(g_true)
-        rates = gamma * g_true / denom                   # (M,)
+        # DN at true orientation
+        rates = dn_pointwise(g[:, idx_true], gamma, sigma_sq)
 
-        # 3. Poisson spikes (uses core.poisson_spike)
-        counts = generate_spikes(rates, T_d, rng)        # (M,)
+        # Poisson spikes
+        counts = generate_spikes(rates, T_d, rng)
 
-        # 4. ML decode: argmax_θ Σ_i n_i · log g_i(θ)
-        ll = counts @ log_g                              # (n_theta,)
+        # Full Poisson ML decode (rate-penalty term retained)
+        ll = compute_log_likelihood(counts, g, T_d)
         idx_hat = np.argmax(ll)
 
-        # 5. Circular error (uses core.ml_decoder)
         errors[t] = compute_circular_error(thetas[idx_true], thetas[idx_hat])
 
     return errors
@@ -176,20 +131,20 @@ def run_experiment(config: Dict) -> Dict:
     gam_lo, gam_hi = config.get('gamma_range', (1.0, 256.0))
     seed      = config.get('seed', 42)
 
-    # Log-spaced grids (matching Bays's 50×50 log grid)
     lambdas = np.logspace(np.log2(lam_lo), np.log2(lam_hi), n_grid, base=2)
     gammas  = np.logspace(np.log2(gam_lo), np.log2(gam_hi), n_grid, base=2)
 
     variance_grid = np.full((n_grid, n_grid), np.nan)
     kurtosis_grid = np.full((n_grid, n_grid), np.nan)
-    variance_half = np.full((n_grid, n_grid), np.nan)  # for exponent
+    variance_half = np.full((n_grid, n_grid), np.nan)
 
     total = n_grid * n_grid
     t0 = time.time()
 
     for i, lam in enumerate(lambdas):
         # Population generated ONCE per lengthscale (tuning ≠ f(γ))
-        thetas, g, log_g = _generate_population(M, n_theta, lam, seed + i * 1000)
+        thetas, f_all = generate_population(M, n_theta, lam, n_locations=1, seed=seed + i * 1000)
+        g = np.exp(f_all[0])
 
         for j, gam in enumerate(gammas):
             idx = i * n_grid + j + 1
@@ -201,18 +156,14 @@ def run_experiment(config: Dict) -> Dict:
 
             rng = np.random.RandomState(seed + i * n_grid + j)
 
-            # Variance & kurtosis at γ
-            errs = _run_trials_at_gain(g, log_g, thetas, gam, T_d, sigma_sq, n_trials, rng)
+            errs = _run_trials_at_gain(g, thetas, gam, T_d, sigma_sq, n_trials, rng)
             variance_grid[j, i] = circular_variance(errs)
             kurtosis_grid[j, i] = circular_kurtosis(errs)
 
-            # Variance at γ/2 (for power-law exponent)
             rng2 = np.random.RandomState(seed + i * n_grid + j + total)
-            errs_half = _run_trials_at_gain(g, log_g, thetas, gam / 2, T_d, sigma_sq, n_trials, rng2)
+            errs_half = _run_trials_at_gain(g, thetas, gam / 2, T_d, sigma_sq, n_trials, rng2)
             variance_half[j, i] = circular_variance(errs_half)
 
-    # Exponent: α = log₂(V(γ) / V(γ/2))
-    # "estimated from the change of variance resulting from halving the gain"
     with np.errstate(divide='ignore', invalid='ignore'):
         ratio = np.where(variance_half > 1e-15, variance_grid / variance_half, np.nan)
         exponent_grid = np.where(ratio > 0, np.log2(ratio), np.nan)
@@ -232,7 +183,7 @@ def run_experiment(config: Dict) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PLOTTING — Publication quality, matching Bays (2014) Fig 1 d,e,f layout
+# PLOTTING
 # ═══════════════════════════════════════════════════════════════════════════
 
 def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
@@ -272,7 +223,6 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
         ax.text(-0.12, 1.06, f'$\\mathbf{{{label}}}$',
                 transform=ax.transAxes, fontsize=15, fontweight='bold', va='top')
 
-    # ── d: Variance ──
     im0 = axes[0].imshow(
         np.clip(V, 1e-3, 10), origin='lower', aspect='auto', extent=extent,
         norm=mcolors.LogNorm(vmin=0.001, vmax=10), cmap='jet', interpolation='bilinear')
@@ -282,7 +232,6 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     cb0.set_ticklabels(['.001', '.01', '.1', '1', '10'])
     _fmt_ax(axes[0], 'd')
 
-    # ── e: Kurtosis ──
     im1 = axes[1].imshow(
         np.clip(K, 0.01, 100), origin='lower', aspect='auto', extent=extent,
         norm=mcolors.LogNorm(vmin=0.01, vmax=100), cmap='jet', interpolation='bilinear')
@@ -292,7 +241,6 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     cb1.set_ticklabels(['.01', '.1', '1', '10', '100'])
     _fmt_ax(axes[1], 'e')
 
-    # ── f: Exponent ──
     im2 = axes[2].imshow(
         np.clip(E, -3, 0), origin='lower', aspect='auto', extent=extent,
         vmin=-3, vmax=0, cmap='jet', interpolation='bilinear')
@@ -328,5 +276,6 @@ if __name__ == '__main__':
     print("Running Bays (2014) Figure 1 d,e,f — GP Equivalent")
     print(f"  Grid: {config['n_grid']}x{config['n_grid']}, "
           f"Trials: {config['n_trials']}, Neurons: {config['M']}")
+    print("  Decoder: FULL Poisson ML (both terms retained)")
     results = run_experiment(config)
     plot_results(results, 'results/figure_1', show_plot=True)
