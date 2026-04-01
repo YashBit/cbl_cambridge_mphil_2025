@@ -32,7 +32,7 @@ import numpy as np
 from typing import Tuple, List, Dict, Optional
 from scipy.special import logsumexp
 
-from divisive_normalization import dn_pointwise, compute_r_pre_at_config
+from core.encoder.divisive_normalization import dn_pointwise, compute_r_pre_at_config
 
 
 # =============================================================================

@@ -36,30 +36,72 @@ Usage:
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
 import matplotlib.gridspec as gridspec
-from scipy.special import logsumexp
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from scipy.special import logsumexp
 import time
 
-from core.encoder.poisson_spike import generate_spikes
+from core.encoder.gaussian_process import (
+    generate_neuron_population, periodic_rbf_kernel, sample_gp_function,
+)
 from core.encoder.divisive_normalization import dn_pointwise
-from core.decoder.ml_decoder import (
-    compute_spike_weighted_log_tuning,
-    compute_circular_error,
-)
-
-from experiments.bays_equivalence.bays_utils import (
-    circular_variance,
-    circular_kurtosis,
-    compute_deviation_from_normal,
-    generate_population,
-)
+from core.encoder.poisson_spike import generate_spikes
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# WEIGHTED MARGINAL LOG-LIKELIHOOD (figure-3 specific)
-# ═══════════════════════════════════════════════════════════════════════════
+def compute_log_likelihood(counts, g, T_d):
+    log_g = np.log(np.maximum(g, 1e-30))
+    return counts @ log_g - T_d * np.sum(g, axis=0)
+
+def compute_circular_error(theta_true, theta_hat):
+    return np.angle(np.exp(1j * (theta_hat - theta_true)))
+
+def circular_variance(errors):
+    return 1.0 - np.abs(np.mean(np.exp(1j * errors)))
+
+def circular_kurtosis(errors):
+    V = circular_variance(errors)
+    rho2 = np.abs(np.mean(np.exp(2j * errors)))
+    kappa2 = 1.0 - rho2
+    return kappa2 / max(V**2, 1e-15) if V > 1e-10 else 0.0
+
+def circular_moments(errors):
+    return {'variance': circular_variance(errors), 'kurtosis': circular_kurtosis(errors),
+            'mean_resultant': float(np.abs(np.mean(np.exp(1j * errors))))}
+
+def compute_deviation_from_normal(errors, n_bins=50):
+    from scipy.stats import vonmises
+    bin_edges = np.linspace(-np.pi, np.pi, n_bins + 1)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    emp, _ = np.histogram(errors, bins=bin_edges, density=True)
+    V = circular_variance(errors)
+    kappa_fit = max(0.01, 1.0 / V - 1) if V > 0.01 else 100.0
+    vm_pdf = vonmises.pdf(centers, kappa_fit)
+    return {'bin_centers': centers, 'empirical': emp, 'normal_fit': vm_pdf,
+            'deviation': emp - vm_pdf}
+
+def generate_population(M, n_theta, lengthscale, n_locations=1, seed=42):
+    population = generate_neuron_population(
+        n_neurons=M, n_orientations=n_theta, n_locations=n_locations,
+        base_lengthscale=lengthscale, lengthscale_variability=0.0, seed=seed)
+    thetas = population[0]['orientations']
+    f_all = []
+    for loc in range(n_locations):
+        f_loc = np.array([population[n]['f_samples'][loc, :] for n in range(M)])
+        f_all.append(f_loc)
+    return thetas, f_all
+
+def compute_spike_weighted_log_tuning(counts, f_list):
+    return [counts @ f_k for f_k in f_list]
+
+def compute_marginal_log_likelihood_efficient(L_list, cued_idx):
+    ll = L_list[cued_idx].copy()
+    for k in range(len(L_list)):
+        if k != cued_idx:
+            ll = ll + logsumexp(L_list[k])
+    return ll
+
 
 def compute_weighted_marginal_log_likelihood(
     L_per_location: List[np.ndarray],
