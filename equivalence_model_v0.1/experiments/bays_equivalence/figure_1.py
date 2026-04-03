@@ -60,10 +60,12 @@ def circular_variance(errors):
     return 1.0 - np.abs(np.mean(np.exp(1j * errors)))
 
 def circular_kurtosis(errors):
-    V = circular_variance(errors)
+    z1 = np.mean(np.exp(1j * errors))
+    rho1 = np.abs(z1)
     rho2 = np.abs(np.mean(np.exp(2j * errors)))
-    kappa2 = 1.0 - rho2
-    return kappa2 / max(V**2, 1e-15) if V > 1e-10 else 0.0
+    V = 1.0 - rho1
+    numerator = rho1**4 - rho2       # excess over wrapped-normal baseline
+    return numerator / max(V**2, 1e-15) if V > 1e-10 else 0.0
 
 def circular_moments(errors):
     return {'variance': circular_variance(errors), 'kurtosis': circular_kurtosis(errors),

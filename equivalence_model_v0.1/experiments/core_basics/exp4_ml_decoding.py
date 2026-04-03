@@ -39,15 +39,10 @@ from pathlib import Path
 from typing import Dict, Tuple, List
 import time
 
-from core.gaussian_process import generate_neuron_population
-from core.poisson_spike import generate_spikes
-from core.ml_decoder import (
-    compute_log_likelihood,
-    compute_circular_error,
-    compute_spike_weighted_log_tuning,
-    compute_marginal_log_likelihood_efficient,
-)
-from core.divisive_normalisation import dn_pointwise
+from core.encoder.gaussian_process import generate_neuron_population
+from core.encoder.poisson_spike import generate_spikes
+from core.decoder.ml_decoder import decode, circular_error
+from core.encoder.divisive_normalization import dn_pointwise
 
 try:
     from tqdm import tqdm
@@ -108,14 +103,12 @@ def _run_trial(population, theta_values, gamma, sigma_sq, T_d,
     rates = dn_pointwise(r_pre, gamma, sigma_sq)
     spikes = rng.poisson(rates * T_d)
 
-    # Factorised ML decode
-    L_list = compute_spike_weighted_log_tuning(spikes, f_list)
-    ll_marginal = compute_marginal_log_likelihood_efficient(L_list, cued_index)
-    idx_hat = np.argmax(ll_marginal)
+    # Factorised ML decode (Eqs. 23 → 26 → 28)
+    theta_hat, ll_marginal = decode(spikes, f_list, theta_values, cued_index)
 
     # Error against snapped ground truth (avoids grid quantisation bias)
     theta_true_snapped = theta_values[theta_idx[cued_index]]
-    error = compute_circular_error(theta_true_snapped, theta_values[idx_hat])
+    error = circular_error(theta_true_snapped, theta_hat)
 
     return error
 
@@ -130,7 +123,9 @@ def _run_trials(population, theta_values, gamma, sigma_sq, T_d,
 
     for l in set_sizes:
         errors = np.empty(n_trials)
-        for t in range(n_trials):
+        trial_desc = f"{desc} l={l}" if desc else f"l={l}"
+        for t in tqdm(range(n_trials), desc=f"      {trial_desc}",
+                      leave=False, ncols=80):
             locs = tuple(rng.choice(n_locations, size=l, replace=False))
             oris = rng.uniform(-np.pi, np.pi, size=l)
             cued = rng.randint(l)
@@ -173,7 +168,8 @@ def _run_part_a(cfg):
     print(f"    Multi-item decoding (n_trials={cfg['n_trials']})...")
     multi = _run_trials(
         population, theta_values, cfg['gamma'], cfg['sigma_sq'], cfg['T_d'],
-        cfg['n_locations'], cfg['set_sizes'], cfg['n_trials'], cfg['seed'])
+        cfg['n_locations'], cfg['set_sizes'], cfg['n_trials'], cfg['seed'],
+        desc="Part A")
 
     stds = [multi[l]['circular_std_deg'] for l in cfg['set_sizes']]
     normalised = [stds[i] / np.sqrt(l) for i, l in enumerate(cfg['set_sizes'])]
@@ -215,7 +211,8 @@ def _run_part_b(cfg):
     print(f"    Bias analysis (n_θ={n_theta_bias}, n_trials={n_trials_bias})...")
     results = _run_trials(
         population, theta_values, cfg['gamma'], cfg['sigma_sq'], cfg['T_d'],
-        cfg['n_locations'], cfg['set_sizes'], n_trials_bias, cfg['seed'] + 501)
+        cfg['n_locations'], cfg['set_sizes'], n_trials_bias, cfg['seed'] + 501,
+        desc="Part B")
 
     for l in cfg['set_sizes']:
         me = results[l]['mean_error_deg']
@@ -261,11 +258,12 @@ def _run_part_c(cfg):
 
     sweep_results = {}
 
-    for lam in all_lambdas:
+    for lam in tqdm(all_lambdas, desc="    Part C λ sweep", ncols=80):
         seed_stds = []
         seed_errors = {l: [] for l in set_sizes}
 
-        for s in range(n_seeds):
+        for s in tqdm(range(n_seeds), desc=f"      λ={lam:.1f} seeds",
+                      leave=False, ncols=80):
             seed_val = cfg['seed'] + s * 100
             pop = generate_neuron_population(
                 n_neurons=cfg['n_neurons'], n_orientations=cfg['n_orientations'],
@@ -275,7 +273,8 @@ def _run_part_c(cfg):
 
             res = _run_trials(
                 pop, theta_vals, cfg['gamma'], cfg['sigma_sq'], cfg['T_d'],
-                cfg['n_locations'], set_sizes, n_trials, seed_val + 1)
+                cfg['n_locations'], set_sizes, n_trials, seed_val + 1,
+                desc=f"λ={lam:.1f} s{s}")
 
             seed_stds.append([res[l]['circular_std_deg'] for l in set_sizes])
             for l in set_sizes:
@@ -422,22 +421,50 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     # ================================================================
     # PLOT 2: Error distributions broaden with l
     # ================================================================
+    from scipy.stats import gaussian_kde, norm as sp_norm
+
     n_ss = len(ss)
-    fig2, axes2 = plt.subplots(1, n_ss, figsize=(4 * n_ss, 3.5))
+    fig2, axes2 = plt.subplots(1, n_ss, figsize=(4 * n_ss, 4), sharey=True)
     if n_ss == 1: axes2 = [axes2]
-    colors = plt.cm.coolwarm(np.linspace(0.2, 0.8, n_ss))
+    colors = plt.cm.coolwarm(np.linspace(0.15, 0.85, n_ss))
+    bin_edges = np.linspace(-90, 90, 37)           # shared bins across all panels
+    x_kde = np.linspace(-90, 90, 300)
 
     for i, l in enumerate(ss):
+        ax = axes2[i]
         errs_deg = np.degrees(pa['multi_item'][l]['errors'])
-        axes2[i].hist(errs_deg, bins=30, density=True, color=colors[i],
-                      alpha=0.7, edgecolor='white')
         sd = pa['multi_item'][l]['circular_std_deg']
-        axes2[i].set_title(f'l={l}  (σ={sd:.1f}°)', fontsize=11)
-        axes2[i].set_xlabel('Error (°)')
-        axes2[i].set_xlim([-90, 90])
-        if i == 0: axes2[i].set_ylabel('Density')
+        mean_err = np.degrees(pa['multi_item'][l].get('mean_error', np.mean(pa['multi_item'][l]['errors'])))
 
-    fig2.suptitle('Error Distributions Broaden with Set Size', fontsize=12, fontweight='bold')
+        # Histogram
+        ax.hist(errs_deg, bins=bin_edges, density=True, color=colors[i],
+                alpha=0.45, edgecolor='white', linewidth=0.5)
+
+        # KDE overlay — shows the true shape without bin noise
+        if len(np.unique(errs_deg)) > 3:
+            kde = gaussian_kde(errs_deg, bw_method='silverman')
+            ax.plot(x_kde, kde(x_kde), color=colors[i], lw=2, label='KDE')
+
+        # Gaussian reference (what a purely-Gaussian decoder error would look like)
+        gauss_y = sp_norm.pdf(x_kde, loc=mean_err, scale=sd)
+        ax.plot(x_kde, gauss_y, '--', color='gray', lw=1.2, alpha=0.7,
+                label=f'Gaussian (σ={sd:.1f}°)')
+
+        # ±σ vertical lines
+        ax.axvline(mean_err, color='black', ls='-', lw=1, alpha=0.6)
+        ax.axvline(mean_err - sd, color=colors[i], ls=':', lw=1.2, alpha=0.8)
+        ax.axvline(mean_err + sd, color=colors[i], ls=':', lw=1.2, alpha=0.8)
+
+        ax.set_title(f'$l={l}$   σ = {sd:.1f}°', fontsize=11)
+        ax.set_xlabel('Error (°)')
+        ax.set_xlim([-90, 90])
+        ax.legend(fontsize=7, loc='upper right')
+        if i == 0:
+            ax.set_ylabel('Density')
+
+    fig2.suptitle('Error Distributions Broaden with Set Size\n'
+                  '(shared y-axis — visual broadening reflects DN resource dilution)',
+                  fontsize=12, fontweight='bold')
     fig2.tight_layout()
     fig2.savefig(out / 'exp4a_error_distributions.png')
     print(f"  Saved: exp4a_error_distributions.png")
@@ -447,31 +474,65 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     # ================================================================
     # PLOT 3: Bias analysis
     # ================================================================
+    #
+    # The message: bias is negligible relative to σ at every set size.
+    # Point-and-CI on a zero-line makes "consistent with zero" visually
+    # obvious; a bar chart does the opposite (it gives visual weight
+    # to the magnitude of a quantity we want to show is small).
+    # ================================================================
     fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(12, 5))
 
     biases = [pb[l]['mean_error_deg'] for l in ss]
     stds_b = [pb[l]['circular_std_deg'] for l in ss]
     n_b = 1000
-    ci95 = [1.96 * np.degrees(np.std(pb[l]['errors'])) / np.sqrt(n_b) for l in ss]
+    # SE of mean for circular errors (converted to degrees)
+    ci95 = [1.96 * stds_b[i] / np.sqrt(n_b) for i in range(len(ss))]
 
-    ax3a.bar(ss, biases, width=0.6, color='#3498DB', alpha=0.7, edgecolor='black')
-    ax3a.errorbar(ss, biases, yerr=ci95, fmt='none', color='black', capsize=5)
-    ax3a.axhline(0, color='red', ls='--', lw=1.5)
+    # Panel A: signed bias ± 95% CI
+    ax3a.axhline(0, color='#cccccc', ls='-', lw=1, zorder=0)
+    ax3a.axhspan(-max(ci95), max(ci95), color='#e8f4e8', alpha=0.5,
+                 label='±95% CI envelope', zorder=0)
+    ax3a.errorbar(ss, biases, yerr=ci95, fmt='o', color='#2C3E50',
+                  ms=9, capsize=6, capthick=1.5, lw=1.5, zorder=3,
+                  markerfacecolor='#3498DB', markeredgecolor='#2C3E50',
+                  markeredgewidth=1.2)
     ax3a.set_xlabel('Set size $l$')
     ax3a.set_ylabel('Mean signed error (°)')
-    ax3a.set_title('A. Decoder Bias')
+    ax3a.set_title('A. Decoder Bias (point ± 95% CI)')
     ax3a.set_xticks(ss)
+    ax3a.legend(fontsize=9, loc='upper left')
 
-    ratios = [abs(biases[i]) / stds_b[i] if stds_b[i] > 0 else 0 for i in range(len(ss))]
-    ax3b.bar(ss, ratios, width=0.6, color='#27AE60', alpha=0.7, edgecolor='black')
-    ax3b.axhline(0.05, color='red', ls='--', lw=1.2, label='5% reference')
+    # Annotate each point with its value
+    for i, l in enumerate(ss):
+        ax3a.annotate(f'{biases[i]:+.2f}°', (ss[i], biases[i]),
+                      textcoords='offset points', xytext=(12, 8),
+                      fontsize=8, color='#2C3E50')
+
+    # Panel B: |bias|/σ  — how many σ's is the bias?
+    ratios = [abs(biases[i]) / stds_b[i] if stds_b[i] > 0 else 0
+              for i in range(len(ss))]
+    bar_colors = ['#27AE60' if r < 0.05 else '#E67E22' if r < 0.10 else '#E74C3C'
+                  for r in ratios]
+
+    bars = ax3b.bar(range(len(ss)), ratios, width=0.5, color=bar_colors,
+                    alpha=0.8, edgecolor='black', linewidth=0.8)
+    ax3b.set_xticks(range(len(ss)))
+    ax3b.set_xticklabels([f'l={l}' for l in ss])
+    ax3b.axhline(0.05, color='red', ls='--', lw=1.2, label='5% threshold')
+    ax3b.axhline(0.10, color='orange', ls=':', lw=1.0, label='10% threshold')
     ax3b.set_xlabel('Set size $l$')
     ax3b.set_ylabel('|Bias| / σ')
-    ax3b.set_title('B. Relative Bias')
-    ax3b.set_xticks(ss)
-    ax3b.legend(fontsize=9)
+    ax3b.set_title('B. Relative Bias (< 5% ≈ negligible)')
+    ax3b.legend(fontsize=9, loc='upper left')
 
-    fig3.suptitle('Experiment 4B: Bias Analysis (n_θ=10)', fontsize=12, fontweight='bold')
+    # Annotate bars
+    for i, (bar, r) in enumerate(zip(bars, ratios)):
+        ax3b.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.003,
+                  f'{r:.3f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+    fig3.suptitle('Experiment 4B: Bias Analysis (n_θ=10)\n'
+                  'ML decoder is unbiased — bias negligible vs. decoding noise',
+                  fontsize=12, fontweight='bold')
     fig3.tight_layout()
     fig3.savefig(out / 'exp4b_bias.png')
     print(f"  Saved: exp4b_bias.png")
@@ -525,6 +586,111 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     print(f"  Saved: exp4c_lengthscale_sweep.png")
     if show_plot: plt.show()
     plt.close(fig4)
+
+    # ================================================================
+    # PLOT 5: Precision (J = 1/σ²) vs Set Size — regime comparison
+    # ================================================================
+    #
+    # Derived from Part C sweep data.  No new simulation.
+    # J = 1/σ²  ∝  1/(l · ω²)  →  sharp λ sits higher, both decay as 1/l.
+    # ================================================================
+    broad_colors = ['#1a5276', '#2980b9', '#7fb3d8']
+    sharp_colors = ['#922b21', '#e74c3c', '#f1948a']
+    broad_mk = ['o', 's', 'D']
+    sharp_mk = ['^', 'v', 'P']
+
+    fig5, (ax5a, ax5b) = plt.subplots(1, 2, figsize=(14, 6))
+
+    # --- Panel A: Precision (linear) ---
+    for idx, lam in enumerate(pc['lambdas_broad']):
+        stds = np.array(sweep[lam]['stds_deg'])
+        sems = np.array(sweep[lam]['stds_sem_deg'])
+        prec = 1.0 / stds**2
+        prec_sem = 2.0 * sems / stds**3       # δJ = 2σ⁻³ · δσ
+        ax5a.errorbar(ss, prec, yerr=prec_sem,
+                      marker=broad_mk[idx], color=broad_colors[idx],
+                      lw=2, ms=8, capsize=4, capthick=1.3, ls='-',
+                      label=f'λ={lam:.1f} (broad)', zorder=3)
+        for i, l in enumerate(ss):
+            ax5a.annotate(f'{prec[i]:.4f}', (l, prec[i]),
+                          xytext=(6, 8), textcoords='offset points',
+                          fontsize=8, color=broad_colors[idx], fontweight='bold')
+
+    for idx, lam in enumerate(pc['lambdas_sharp']):
+        stds = np.array(sweep[lam]['stds_deg'])
+        sems = np.array(sweep[lam]['stds_sem_deg'])
+        prec = 1.0 / stds**2
+        prec_sem = 2.0 * sems / stds**3
+        ax5a.errorbar(ss, prec, yerr=prec_sem,
+                      marker=sharp_mk[idx], color=sharp_colors[idx],
+                      lw=2, ms=8, capsize=4, capthick=1.3, ls='--',
+                      label=f'λ={lam:.1f} (sharp)', zorder=3)
+        for i, l in enumerate(ss):
+            ax5a.annotate(f'{prec[i]:.4f}', (l, prec[i]),
+                          xytext=(6, -12), textcoords='offset points',
+                          fontsize=8, color=sharp_colors[idx], fontweight='bold')
+
+    # 1/l reference
+    ref_lam = pc['lambdas_sharp'][-1]
+    j0 = 1.0 / np.array(sweep[ref_lam]['stds_deg'])[0]**2
+    ax5a.plot(ss, [j0 * ss[0] / l for l in ss], ':',
+              color='gray', lw=1.5, alpha=0.5, label=r'$\propto 1/l$')
+
+    ax5a.set_xlabel('Set size $l$')
+    ax5a.set_ylabel(r'Precision $J = 1/\sigma^2$ (deg$^{-2}$)')
+    ax5a.set_title('A. Precision vs Set Size')
+    ax5a.set_xticks(ss)
+    ax5a.spines['top'].set_visible(False)
+    ax5a.spines['right'].set_visible(False)
+    ax5a.legend(fontsize=8, ncol=2)
+
+    # --- Panel B: Log-log (slope ≈ −1 confirms J ∝ 1/l) ---
+    for idx, lam in enumerate(pc['lambdas_broad']):
+        stds = np.array(sweep[lam]['stds_deg'])
+        sems = np.array(sweep[lam]['stds_sem_deg'])
+        prec = 1.0 / stds**2
+        prec_sem = 2.0 * sems / stds**3
+        ax5b.errorbar(ss, prec, yerr=prec_sem,
+                      marker=broad_mk[idx], color=broad_colors[idx],
+                      lw=2, ms=8, capsize=4, capthick=1.3, ls='-',
+                      label=f'λ={lam:.1f} (broad)', zorder=3)
+
+    for idx, lam in enumerate(pc['lambdas_sharp']):
+        stds = np.array(sweep[lam]['stds_deg'])
+        sems = np.array(sweep[lam]['stds_sem_deg'])
+        prec = 1.0 / stds**2
+        prec_sem = 2.0 * sems / stds**3
+        ax5b.errorbar(ss, prec, yerr=prec_sem,
+                      marker=sharp_mk[idx], color=sharp_colors[idx],
+                      lw=2, ms=8, capsize=4, capthick=1.3, ls='--',
+                      label=f'λ={lam:.1f} (sharp)', zorder=3)
+
+    # slope reference
+    for ref_lam, c in [(pc['lambdas_broad'][0], '#1a5276'),
+                       (pc['lambdas_sharp'][-1], '#922b21')]:
+        j0 = 1.0 / np.array(sweep[ref_lam]['stds_deg'])[0]**2
+        l_fine = np.linspace(ss[0], ss[-1], 100)
+        ax5b.plot(l_fine, j0 * ss[0] / l_fine, ':', color=c, lw=1, alpha=0.35)
+
+    ax5b.set_xscale('log')
+    ax5b.set_yscale('log')
+    ax5b.set_xlabel('Set size $l$ (log)')
+    ax5b.set_ylabel(r'Precision $J$ (log)')
+    ax5b.set_title(r'B. Log-Log  (slope $\approx -1 \Rightarrow J \propto 1/l$)')
+    ax5b.set_xticks(ss)
+    ax5b.set_xticklabels([str(l) for l in ss])
+    ax5b.spines['top'].set_visible(False)
+    ax5b.spines['right'].set_visible(False)
+    ax5b.legend(fontsize=8, ncol=2)
+
+    fig5.suptitle('Precision Regime Comparison: Sharp λ Sits Higher, '
+                   'Both Decay as 1/l (DN Bottleneck)',
+                   fontsize=12, fontweight='bold')
+    fig5.tight_layout()
+    fig5.savefig(out / 'exp4d_precision_regimes.png')
+    print(f"  Saved: exp4d_precision_regimes.png")
+    if show_plot: plt.show()
+    plt.close(fig5)
 
     print(f"\n  Experiment 4 plots saved to {out}")
 

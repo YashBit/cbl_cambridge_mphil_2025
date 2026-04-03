@@ -38,8 +38,8 @@ from pathlib import Path
 from tqdm import tqdm
 import time
 
-from core.gaussian_process import generate_neuron_population
-from core.divisive_normalisation import (
+from core.encoder.gaussian_process import generate_neuron_population
+from core.encoder.divisive_normalization import (
     dn_pointwise,
     total_post_activity,
     per_item_activity,
