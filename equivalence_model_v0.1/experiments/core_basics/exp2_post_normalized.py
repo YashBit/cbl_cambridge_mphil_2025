@@ -124,6 +124,9 @@ def run_experiment_2(config: Dict) -> Dict:
         theo_per_item = per_item_activity(gamma, N, l)
         cap_check = verify_activity_cap(np.mean(post_totals), gamma, N)
 
+        # Empirical per-item: measured from actual post-DN totals
+        empirical_per_item = np.mean(post_totals) / l
+
         results['set_size_data'][l] = {
             'n_subsets': n_subsets,
             'pre_total_mean': np.mean(pre_totals),
@@ -131,7 +134,8 @@ def run_experiment_2(config: Dict) -> Dict:
             'post_total_mean': np.mean(post_totals),
             'post_total_std': np.std(post_totals),
             'theoretical_total': theo_total,
-            'per_item_activity': theo_per_item,
+            'per_item_theoretical': theo_per_item,
+            'per_item_empirical': empirical_per_item,
             'activity_cap_error': cap_check['relative_error'],
             'neuron_mean': np.mean(neuron_avg),
             'neuron_std': np.std(neuron_avg),
@@ -139,7 +143,7 @@ def run_experiment_2(config: Dict) -> Dict:
 
         print(f"post-DN total={np.mean(post_totals):.1f} Hz  "
               f"(theory: {theo_total:.0f})  "
-              f"per-item={theo_per_item:.1f} Hz")
+              f"per-item: empirical={empirical_per_item:.1f} theory={theo_per_item:.1f} Hz")
 
     print("\n" + "=" * 70)
     return results
@@ -175,10 +179,11 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     # ================================================================
     fig1, ax1 = plt.subplots(figsize=(8, 5.5))
 
-    empirical = [results['set_size_data'][l]['per_item_activity'] for l in set_sizes]
-    theoretical = [gamma * N / l for l in set_sizes]
+    empirical = [results['set_size_data'][l]['per_item_empirical'] for l in set_sizes]
+    theoretical = [results['set_size_data'][l]['per_item_theoretical'] for l in set_sizes]
 
-    ax1.plot(set_sizes, empirical, 'o-', color='#2E86AB', lw=2, ms=8, label='Empirical')
+    ax1.plot(set_sizes, empirical, 'o-', color='#2E86AB', lw=2, ms=8,
+             label=r'Empirical: $\Sigma\, r_i^{\mathrm{post}} \,/\, l$')
     ax1.plot(set_sizes, theoretical, '--', color='#E74C3C', lw=2, label=r'Theory: $\gamma N / l$')
 
     ax1.set_xlabel('Set size $l$')
@@ -301,12 +306,13 @@ def plot_results(results: Dict, output_dir: str, show_plot: bool = False):
     plt.close(fig3)
 
     # Summary table
-    print(f"\n  {'l':<6} {'Pre-DN':>12} {'Post-DN':>12} {'Per-Item':>10} {'Cap Error':>12}")
-    print("  " + "-" * 56)
+    print(f"\n  {'l':<6} {'Pre-DN':>12} {'Post-DN':>12} {'Per-Item(emp)':>14} {'Per-Item(thy)':>14} {'Cap Error':>12}")
+    print("  " + "-" * 74)
     for l in set_sizes:
         r = results['set_size_data'][l]
         print(f"  {l:<6} {r['pre_total_mean']:>10,.1f}Hz {r['post_total_mean']:>10,.1f}Hz "
-              f"{r['per_item_activity']:>8,.1f}Hz {r['activity_cap_error']:>10.4%}")
+              f"{r['per_item_empirical']:>12,.1f}Hz {r['per_item_theoretical']:>12,.1f}Hz "
+              f"{r['activity_cap_error']:>10.4%}")
 
     print(f"\n  Experiment 2 plots saved to {output_path}")
 
