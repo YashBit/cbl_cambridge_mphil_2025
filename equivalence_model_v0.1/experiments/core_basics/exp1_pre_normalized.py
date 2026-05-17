@@ -31,20 +31,21 @@ Paper equations implemented:
     E[r^pre] = ḡ^l,  ḡ = exp(σ²_f / 2) ≈ 1.65              [Eq. 11]
 """
 
+import time
 import numpy as np
+from tqdm import tqdm
 from itertools import combinations
 from pathlib import Path
 from typing import Dict
-import time
+
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core.gaussian_process import (
+from core.encoder.gaussian_process import (
     generate_neuron_population,
-    compute_pre_normalized_response,
 )
-from core.divisive_normalisation import compute_r_pre_at_config
+from core.encoder.divisive_normalization import compute_r_pre_at_config
 from analysis.separability import summarize_separability
 
 
@@ -112,22 +113,42 @@ def _band_stats(values):
 # inequality prediction.
 # =============================================================================
 
-def _run_part_a(population, cfg):
-    """Exhaustive enumeration of pre-normalised responses."""
+def _run_part_a(population, cfg, F_stacked=None):
+    """
+    Estimate E[r^pre] at each set size via sampled θ configurations.
+
+    For every C(L,l) location subset we draw n_theta_samples independent
+    orientation vectors θ ∈ {0,…,n_θ-1}^l, evaluate r^pre for each
+    (subset, θ) pair across all N neurons simultaneously using
+    compute_r_pre_at_config, and average.
+
+    This replaces the old call to compute_pre_normalized_response which
+    constructed the full n_θ^l tensor product — OOM for l ≥ 4.
+    """
     set_sizes = cfg['set_sizes']
     L = cfg['n_locations']
+    N = cfg['n_neurons']
+    n_theta = cfg['n_orientations']
+    n_theta_samples = cfg.get('n_theta_samples_a', 200)
+    rng = np.random.default_rng(cfg['seed'] + 1000)
 
-    # For each neuron, average r^pre over all subsets
-    neuron_means = {l: [] for l in set_sizes}
+    if F_stacked is None:
+        F_stacked = np.stack([neuron['f_samples'] for neuron in population])
 
-    for neuron in population:
-        f = neuron['f_samples']  # (L, n_θ)
-        for l in set_sizes:
-            subset_avgs = []
-            for subset in combinations(range(L), l):
-                R_pre = compute_pre_normalized_response(f, subset)
-                subset_avgs.append(np.mean(R_pre))
-            neuron_means[l].append(np.mean(subset_avgs))
+    neuron_means = {l: None for l in set_sizes}
+
+    for l in tqdm(set_sizes, desc="  Part A set sizes"):
+        # Accumulate r^pre across all (subset, θ) samples — shape (N,)
+        running_sum = np.zeros(N)
+        n_total = 0
+        subsets = list(combinations(range(L), l))
+        for subset in tqdm(subsets, desc=f"    l={l} subsets", leave=False):
+            for _ in range(n_theta_samples):
+                active_theta = rng.integers(0, n_theta, size=l).tolist()
+                running_sum += compute_r_pre_at_config(
+                    F_stacked, subset, active_theta)
+                n_total += 1
+        neuron_means[l] = (running_sum / n_total).tolist()
 
     # Population statistics
     pop_means = {l: np.mean(neuron_means[l]) for l in set_sizes}
@@ -256,8 +277,8 @@ def run_experiment_1(config):
     )
     F_stacked = np.stack([neuron['f_samples'] for neuron in population])
 
-    print("\n  Part A: Exponential growth (exhaustive)...")
-    part_a = _run_part_a(population, cfg)
+    print("\n  Part A: Exponential growth (sampled θ configurations)...")
+    part_a = _run_part_a(population, cfg, F_stacked=F_stacked)
     fit_a = part_a['fit']
     print(f"    ḡ = {fit_a['g_bar']:.3f}  (theory: exp(σ²_f/2) ≈ 1.65)")
     print(f"    R² = {fit_a['r_squared']:.6f}")

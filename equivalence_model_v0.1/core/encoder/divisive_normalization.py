@@ -5,7 +5,12 @@ Divisive Normalization Module
 Implements population-level divisive normalization (Eq. 6/14 of the paper):
 
     r^{post}_i(S, θ) = γ · r^{pre}_i(S, θ) / D(S, θ)
-
+    SUM(r^{post}_i(S, θ)) = GAMMA/D(S, THETA) * SUM(r^{pre}_i(S, θ))
+    SUM(r^{post}_i(S, θ)) = GAMMA*N (TOTAL FIRING RATE)
+    GAMMA = SUM(r^{post}_i(S, θ))/N = MEAN POPULATION RATE (WHEN SIGMA = 0)
+    
+    ####### COMPARATIVE ANALYSIS
+    In Bays = GAMMA is TFR, Ours is MFR
 where:
     r^{pre}_i(S, θ) = ∏_{k ∈ S} exp(f_{i,k}(θ_k))      [Eq. 13]
     D(S, θ) = σ² + N⁻¹ Σ_{j=1}^{N} r^{pre}_j(S, θ)     [Eq. 14]

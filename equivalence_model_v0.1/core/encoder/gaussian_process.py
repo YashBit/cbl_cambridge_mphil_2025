@@ -104,37 +104,142 @@ def generate_location_dependent_lengthscales(
     n_locations: int,
     base_lengthscale: float,
     variability: float,
-    random_state: np.random.RandomState
+    random_state: np.random.RandomState,
+    use_gamma: bool = False,
+    method: Optional[str] = None,
+    n_high: int = 1,
+    high_multiplier: float = 3.0,
 ) -> np.ndarray:
     """
     Generate location-dependent lengthscales (source of mixed selectivity).
-    
-    λ_i = λ_base × |1 + σ_λ × z_i| where z_i ~ N(0, 1)
-    
-    This creates heterogeneous tuning widths across locations, breaking
-    separability and creating conjunctive (mixed) selectivity.
-    
+
+    Three distribution options, selectable via `method`:
+
+    1. Folded-Normal (`method="folded_normal"`, default):
+        λ_i = λ_base × |1 + σ_λ × z_i| where z_i ~ N(0, 1)
+        A Normal distribution folded at zero via abs(), then floored at
+        0.1 for numerical stability. I.i.d. across locations.
+
+    2. Gamma (`method="gamma"`):
+        λ_i ~ Gamma(shape=k, scale=θ)
+        with parameters chosen so that:
+            mean(λ_i) = base_lengthscale
+            CV(λ_i)  = std/mean = variability
+        which gives:
+            k = 1 / variability² (shape)
+            θ = base_lengthscale × variability² (scale)
+        Natively defined on (0, ∞) — no folding required — giving a
+        smooth, principled prior. I.i.d. across locations.
+
+    3. Random-Vector (`method="random_vector"`):
+        Non-i.i.d. two-component scheme. A small number of locations
+        (`n_high`, default 1) are designated "high" and drawn from a
+        Gaussian centred at `base_lengthscale * high_multiplier`; the
+        remaining locations are "low" and drawn from a Gaussian centred
+        at `base_lengthscale`. Both Gaussians use `variability` as
+        their std (in folded-Normal style: |1 + σ_λ · z|). The high
+        location(s) are chosen uniformly at random.
+
+        This creates structured asymmetry — most locations have sharp
+        tuning, with one (or a few) "broad" outlier locations — rather
+        than the symmetric heterogeneity of methods 1–2. The result is
+        a mixed-selective neuron with a dominant broad-tuning location.
+
+    All three options break separability and create conjunctive (mixed)
+    selectivity, but the random-vector method produces a qualitatively
+    different population structure: asymmetric instead of symmetric
+    heterogeneity.
+
     Parameters
     ----------
     n_locations : int
-        Number of spatial locations
+        Number of spatial locations.
     base_lengthscale : float
-        Base lengthscale λ_base
+        Base lengthscale λ_base. Interpreted as the (low-component) mean
+        in all three methods.
     variability : float
-        Standard deviation σ_λ controlling heterogeneity
+        Variability parameter σ_λ controlling heterogeneity.
+        - Folded-Normal: std of the underlying Normal before folding.
+        - Gamma: target coefficient of variation (std/mean).
+        - Random-Vector: std of both component Gaussians (folded style).
     random_state : np.random.RandomState
-        Random state for reproducibility
-        
+        Random state for reproducibility.
+    use_gamma : bool, optional
+        Deprecated. If True and `method` is None, behaves as if
+        `method="gamma"`. Ignored when `method` is explicitly set.
+        Retained for backward compatibility.
+    method : str or None, optional
+        Sampling method. One of `"folded_normal"`, `"gamma"`,
+        `"random_vector"`. If None, falls back to `use_gamma` for
+        backward compatibility (`use_gamma=True` → `"gamma"`,
+        `use_gamma=False` → `"folded_normal"`).
+    n_high : int, optional
+        Random-vector mode only. Number of "high" (broad-tuning)
+        locations. Default 1. Clamped to [0, n_locations].
+    high_multiplier : float, optional
+        Random-vector mode only. Multiplier on `base_lengthscale` that
+        sets the mean of the high-component Gaussian. Default 3.0.
+
     Returns
     -------
     lengthscales : np.ndarray
-        Location-dependent lengthscales, shape (n_locations,)
+        Location-dependent lengthscales, shape (n_locations,).
     """
-    random_factors = 1.0 + variability * random_state.randn(n_locations)
-    random_factors = np.abs(random_factors)  # Ensure positive
-    # Ensure minimum lengthscale for numerical stability
-    lengthscales = base_lengthscale * random_factors
-    lengthscales = np.maximum(lengthscales, 0.1)  # Floor at 0.1
+    # Resolve method (preferred API) with use_gamma fallback for back-compat.
+    if method is None:
+        method = "gamma" if use_gamma else "folded_normal"
+    method = method.lower()
+
+    if method == "folded_normal":
+        # I.i.d. folded-Normal: λ_i = λ_base · |1 + σ_λ · z_i|.
+        random_factors = 1.0 + variability * random_state.randn(n_locations)
+        random_factors = np.abs(random_factors)
+        lengthscales = base_lengthscale * random_factors
+
+    elif method == "gamma":
+        # I.i.d. Gamma parameterised by mean and CV.
+        # mean = k·θ, var = k·θ², so CV = 1/√k.
+        # ⇒ k = 1/CV², θ = mean·CV².
+        if variability <= 0:
+            lengthscales = np.full(n_locations, base_lengthscale)
+        else:
+            shape = 1.0 / (variability ** 2)
+            scale = base_lengthscale * (variability ** 2)
+            lengthscales = random_state.gamma(
+                shape=shape, scale=scale, size=n_locations
+            )
+
+    elif method == "random_vector":
+        # Non-i.i.d. two-component scheme.
+        # `n_high` locations drawn from a Gaussian centred at the high mean;
+        # remaining locations drawn from a Gaussian centred at the low mean.
+        # Both use `variability` as std (folded-Normal style for positivity).
+        n_high_eff = int(np.clip(n_high, 0, n_locations))
+
+        # Choose which locations are "high" uniformly at random (no replacement).
+        high_indices = random_state.choice(
+            n_locations, size=n_high_eff, replace=False
+        )
+        is_high = np.zeros(n_locations, dtype=bool)
+        is_high[high_indices] = True
+
+        # Sample folded-Normal factors and scale by component mean.
+        z = random_state.randn(n_locations)
+        factors = np.abs(1.0 + variability * z)
+
+        low_mean = base_lengthscale
+        high_mean = base_lengthscale * high_multiplier
+
+        lengthscales = np.where(is_high, high_mean, low_mean) * factors
+
+    else:
+        raise ValueError(
+            f"Unknown method '{method}'. "
+            f"Expected one of: 'folded_normal', 'gamma', 'random_vector'."
+        )
+
+    # Floor at 0.1 for numerical stability of the GP kernel.
+    lengthscales = np.maximum(lengthscales, 0.1)
     return lengthscales
 
 
@@ -148,7 +253,11 @@ def generate_neuron_tuning_curves(
     base_lengthscale: float,
     lengthscale_variability: float,
     random_state: np.random.RandomState,
-    gain_variability: float = 0.2
+    gain_variability: float = 0.2,
+    use_gamma: bool = False,
+    method: Optional[str] = None,
+    n_high: int = 1,
+    high_multiplier: float = 3.0,
 ) -> Dict:
     """
     Generate tuning curves for a single neuron across all locations.
@@ -173,6 +282,18 @@ def generate_neuron_tuning_curves(
         Random state for reproducibility
     gain_variability : float
         Variability in gain modulation across locations
+    use_gamma : bool, optional
+        Deprecated. Kept for backward compatibility; see
+        `generate_location_dependent_lengthscales`.
+    method : str or None, optional
+        Lengthscale sampling method: `"folded_normal"`, `"gamma"`, or
+        `"random_vector"`. If None, falls back to `use_gamma`.
+    n_high : int, optional
+        Random-vector method only. Number of "high" (broad-tuning)
+        locations. Default 1.
+    high_multiplier : float, optional
+        Random-vector method only. Multiplier on `base_lengthscale`
+        setting the high-component mean. Default 3.0.
         
     Returns
     -------
@@ -191,7 +312,11 @@ def generate_neuron_tuning_curves(
     
     # Generate location-dependent lengthscales
     lengthscales = generate_location_dependent_lengthscales(
-        n_locations, base_lengthscale, lengthscale_variability, random_state
+        n_locations, base_lengthscale, lengthscale_variability, random_state,
+        use_gamma=use_gamma,
+        method=method,
+        n_high=n_high,
+        high_multiplier=high_multiplier,
     )
     
     # Sample GP functions for each location
@@ -225,7 +350,11 @@ def generate_neuron_population(
     base_lengthscale: float,
     lengthscale_variability: float,
     seed: int,
-    gain_variability: float = 0.2
+    gain_variability: float = 0.2,
+    use_gamma: bool = False,
+    method: Optional[str] = None,
+    n_high: int = 1,
+    high_multiplier: float = 3.0,
 ) -> List[Dict]:
     """
     Generate a population of neurons with mixed selectivity.
@@ -249,6 +378,18 @@ def generate_neuron_population(
         Master random seed
     gain_variability : float
         Gain variability
+    use_gamma : bool, optional
+        Deprecated. Kept for backward compatibility; see
+        `generate_location_dependent_lengthscales`.
+    method : str or None, optional
+        Lengthscale sampling method: `"folded_normal"`, `"gamma"`, or
+        `"random_vector"`. If None, falls back to `use_gamma`.
+    n_high : int, optional
+        Random-vector method only. Number of "high" (broad-tuning)
+        locations per neuron. Default 1.
+    high_multiplier : float, optional
+        Random-vector method only. Multiplier on `base_lengthscale`
+        setting the high-component mean. Default 3.0.
         
     Returns
     -------
@@ -269,7 +410,11 @@ def generate_neuron_population(
             base_lengthscale=base_lengthscale,
             lengthscale_variability=lengthscale_variability,
             random_state=neuron_rng,
-            gain_variability=gain_variability
+            gain_variability=gain_variability,
+            use_gamma=use_gamma,
+            method=method,
+            n_high=n_high,
+            high_multiplier=high_multiplier,
         )
         neuron_data['neuron_idx'] = neuron_idx
         neuron_data['seed'] = neuron_seed

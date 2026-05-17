@@ -39,9 +39,9 @@ from pathlib import Path
 from typing import Dict, Tuple
 import time
 
-from core.gaussian_process import generate_neuron_population
-from core.poisson_spike import generate_spikes
-from core.divisive_normalisation import dn_pointwise, total_post_activity, per_item_activity
+from core.encoder.gaussian_process import generate_neuron_population
+from core.encoder.poisson_spike import generate_spikes
+from core.encoder.divisive_normalization import dn_pointwise, total_post_activity, per_item_activity
 
 
 # =============================================================================

@@ -44,17 +44,32 @@ def decode(
     f_per_location: List[np.ndarray],
     theta_grid: np.ndarray,
     cued_location: int
-) -> Tuple[float, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Efficient ML decoding with factorised marginalisation.
+    Vectorised over a batch of trials.
+
+    The full marginal log-likelihood (Eq. 26) is:
+
+        L_M(θ_c) = L_c(θ_c)  +  Σ_{k≠c} logsumexp(L_k)
+
+    The non-cued logsumexp terms are scalars w.r.t. θ_c, so they vanish
+    under argmax. We therefore compute only L_c(θ_c) — one matmul against
+    the cued location's tuning matrix — instead of doing l matmuls and
+    l−1 logsumexps. The returned L_marginal is L_c(θ_c) alone; it differs
+    from the full L_M by a θ-independent additive constant.
+
+    Complexity drops from O(N · l · n_θ) to O(N · n_θ).
 
     Parameters
     ----------
-    spike_counts : np.ndarray, shape (N,)
-        Observed spike counts from all neurons.
+    spike_counts : np.ndarray
+        Observed spike counts. Either shape (N,) for a single trial or
+        (n_trials, N) for a batch.
     f_per_location : list of np.ndarray, each shape (N, n_θ)
         f_per_location[k][i, :] = f_{i,k}(θ) — log-rate tuning of neuron i
         at the k-th active location, evaluated on the orientation grid.
+        Only f_per_location[cued_location] is read.
     theta_grid : np.ndarray, shape (n_θ,)
         Orientation grid values.
     cued_location : int
@@ -62,22 +77,29 @@ def decode(
 
     Returns
     -------
-    theta_hat : float
-        ML orientation estimate at the cued location.
-    L_marginal : np.ndarray, shape (n_θ,)
-        Marginal log-likelihood curve over the grid.
+    theta_hat : float (single trial) or np.ndarray of shape (n_trials,)
+        ML orientation estimate(s) at the cued location.
+    L_marginal : np.ndarray
+        Shape (n_θ,) for single trial; (n_trials, n_θ) for a batch.
+        Contains L_c(θ_c) — see note above on the dropped constant.
     """
-    # Eq. 23:  L_k(θ) = Σ_i n_i f_{i,k}(θ)   for each location k
-    L_list = [spike_counts @ f_k for f_k in f_per_location]
+    f_k = f_per_location[cued_location]                    # (N, n_θ)
 
-    # Eq. 26:  L_M(θ_c) = L_c(θ_c) + Σ_{k≠c} logsumexp(L_k)
-    L_marginal = L_list[cued_location].copy()
-    for k, L_k in enumerate(L_list):
-        if k != cued_location:
-            L_marginal += logsumexp(L_k)       # scalar, constant w.r.t. θ_c
+    # Promote 1-D input to (1, N) for the batched matmul, but remember
+    # whether to squeeze on return so single-trial callers get a scalar.
+    counts_2d = np.atleast_2d(spike_counts)                # (n_trials, N)
+    is_single_trial = (spike_counts.ndim == 1)
+    n_trials = counts_2d.shape[0]
+
+    # Eq. 23:  L_c(θ_c) = Σ_i n_i · f_{i,c}(θ_c)
+    L_marginal = counts_2d @ f_k                           # (n_trials, n_θ)
 
     # Eq. 28
-    theta_hat = theta_grid[np.argmax(L_marginal)]
+    theta_hat_idx = np.argmax(L_marginal, axis=1)          # (n_trials,)
+    theta_hat = theta_grid[theta_hat_idx]                  # (n_trials,)
+
+    if is_single_trial:
+        return float(theta_hat[0]), L_marginal[0]
     return theta_hat, L_marginal
 
 
@@ -107,6 +129,44 @@ def circular_std(errors: np.ndarray, period: float = 2 * np.pi) -> float:
     R = np.abs(np.mean(np.exp(1j * phases)))
     R = np.clip(R, 1e-10, 1.0 - 1e-10)
     return np.sqrt(-2 * np.log(R)) * (period / (2 * np.pi))
+
+
+def circular_variance_fisher(errors: np.ndarray) -> float:
+    """
+    Squared circular SD (Fisher 1995), as used by Bays (2014):
+
+        σ² = −2 log |m̄₁|
+
+    where m̄₁ is the first trigonometric moment.
+
+    This is unbounded above (→ ∞ as concentration → 0) and matches the
+    variance scale in Bays's Fig 1d [0.001, 10].
+
+    Not to be confused with circular variance V = 1 − |m̄₁|, which is
+    bounded to [0, 1].
+    """
+    R = np.abs(np.mean(np.exp(1j * errors)))
+    return -2.0 * np.log(max(R, 1e-15))
+
+
+def circular_kurtosis_fisher(errors: np.ndarray) -> float:
+    """
+    Fisher (1995) circular kurtosis, as cited by Bays (2014):
+
+        κ = [ρ₂ cos(Arg(m₂) − 2·Arg(m₁)) − ρ₁⁴] / (1 − ρ₁)²
+
+    where m_n is the nth uncentered trigonometric moment and ρ_n = |m_n|.
+
+    Uses (1 − ρ₁)² in the denominator (standard Fisher form).
+    """
+    m1 = np.mean(np.exp(1j * errors))
+    m2 = np.mean(np.exp(2j * errors))
+    rho1 = np.abs(m1)
+    rho2 = np.abs(m2)
+    V = 1.0 - rho1
+    phase_correction = np.cos(np.angle(m2) - 2 * np.angle(m1))
+    numerator = rho2 * phase_correction - rho1**4
+    return numerator / max(V**2, 1e-15) if V > 1e-10 else 0.0
 
 
 # =============================================================================
