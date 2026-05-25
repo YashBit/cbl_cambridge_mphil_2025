@@ -17,6 +17,15 @@ Usage:
     theta_hat, L_marg = pop.decode(counts, active_locations, cued_location)
     errors = pop.run_trials(n_trials, gamma, T_d, set_size=4)
 
+    # Bays Fig 3 / cued recall:
+    errors_cued = pop.run_trials(
+        n_trials, gamma, T_d, set_size=4,
+        active_locations=tuple(range(4)),        # deterministic ordering
+        probe_cued=True,                         # always probe loc 0
+        alpha=2.3,                               # recruitment boost
+        recruited_mask=mask,                     # which neurons to boost
+    )
+
 encode() and decode() are the single source of truth for the pipeline.
 run_trials() is a vectorised convenience wrapper that implements the same
     logic in batch for performance (~50-100× faster than looping).
@@ -235,6 +244,10 @@ class Population:
         set_size: int = 1,
         sigma_sq: float = 1e-6,
         rng: Optional[np.random.RandomState] = None,
+        active_locations: Optional[Tuple[int, ...]] = None,
+        probe_cued: Optional[bool] = None,
+        alpha: float = 1.0,
+        recruited_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Run n_trials of encode → decode, return circular errors.
@@ -244,6 +257,7 @@ class Population:
 
         Encode (vectorised over trials):
             r_pre[n, t] = exp( Σ_k  f[n, locs[t,k], θ_idxs[t,k]] )   (Eq. 13)
+            r_pre[recruited, t] *= alpha                              (Fig 3 cue)
             D[t]        = σ² + mean_n( r_pre[n, t] )
             r_post[n,t] = γ · r_pre[n,t] / D[t]                       (Eq. 6)
             counts[n,t] ~ Poisson( r_post[n,t] · T_d )                (Def. 4.5)
@@ -268,6 +282,27 @@ class Population:
         sigma_sq : float
         rng : RandomState, optional
 
+        active_locations : tuple of int, optional
+            Deterministic location set used on EVERY trial. When supplied,
+            location 0 of this tuple is the conventional cued location
+            (used together with ``probe_cued`` and ``recruited_mask``).
+            When None (default), locations are sampled per trial as
+            before — backwards compatible with prior Figure 2 usage.
+        probe_cued : bool, optional
+            Only meaningful when ``active_locations`` is supplied.
+              - True  → every trial probes location 0 (the cued location).
+              - False → every trial probes a location uniformly sampled
+                        from active_locations[1:] (an uncued location).
+              - None  → uniform sampling over all active_locations
+                        (default trial-runner behaviour).
+        alpha : float, default 1.0
+            Multiplicative boost on the pre-DN drive of the neurons
+            selected by ``recruited_mask``. 1.0 = no boost (no cue).
+        recruited_mask : np.ndarray of bool, shape (N,), optional
+            Boolean mask over neurons. The boost ``alpha`` is applied
+            to r_pre[recruited_mask, :] before DN. Required when
+            ``alpha != 1.0``.
+
         Returns
         -------
         errors : np.ndarray, shape (n_trials,)
@@ -279,8 +314,34 @@ class Population:
         l = set_size
         N, L, n_theta = self.N, self.L, self.n_theta
 
+        # ---- Validate the recruitment-boost arguments ----
+        if alpha != 1.0 and recruited_mask is None:
+            raise ValueError(
+                "alpha != 1.0 requires recruited_mask "
+                "(boolean mask of shape (N,) marking which neurons "
+                "receive the boost)."
+            )
+        if recruited_mask is not None:
+            recruited_mask = np.asarray(recruited_mask, dtype=bool)
+            if recruited_mask.shape != (N,):
+                raise ValueError(
+                    f"recruited_mask must have shape ({N},), "
+                    f"got {recruited_mask.shape}"
+                )
+
         # ---- 1. Sample all configurations upfront ----
-        if l == 1:
+        if active_locations is not None:
+            # Deterministic location ordering on every trial. This is the
+            # convention used by both Figure 2 (active_locs = range(N)) and
+            # Figure 3 (cued = location 0, uncued ∈ active_locations[1:]).
+            active_arr = np.asarray(active_locations, dtype=int)
+            if active_arr.size != l:
+                raise ValueError(
+                    f"active_locations has length {active_arr.size}, "
+                    f"expected set_size={l}."
+                )
+            locs = np.tile(active_arr, (n_trials, 1))    # (n_trials, l)
+        elif l == 1:
             locs = rng.randint(L, size=(n_trials, 1))
         elif l >= L:
             locs = np.tile(np.arange(L), (n_trials, 1))
@@ -290,8 +351,24 @@ class Population:
             locs = rng.random((n_trials, L)).argsort(axis=1)[:, :l]
 
         theta_idxs = rng.randint(n_theta, size=(n_trials, l))
-        cued = (np.zeros(n_trials, dtype=int) if l == 1
-                else rng.randint(l, size=n_trials))
+
+        # Cued-index resolution -------------------------------------------
+        # `cued` is the index INTO each trial's `locs` row of the probed
+        # item, NOT the location id itself. The Bays Fig 3 convention is
+        # cued = index 0 of the deterministic location tuple.
+        if probe_cued is True:
+            cued = np.zeros(n_trials, dtype=int)
+        elif probe_cued is False:
+            if l <= 1:
+                raise ValueError(
+                    "probe_cued=False is undefined for set_size <= 1 "
+                    "(no uncued location to probe)."
+                )
+            # Uniform sample from {1, ..., l-1}
+            cued = rng.randint(1, l, size=n_trials)
+        else:
+            cued = (np.zeros(n_trials, dtype=int) if l == 1
+                    else rng.randint(l, size=n_trials))
 
         # ---- 2. Vectorised encode ----
         # r_pre[n, t] = exp( Σ_k f[n, locs[t,k], θ_idxs[t,k]] )
@@ -301,6 +378,11 @@ class Population:
             log_r_pre += self.f[:, locs[:, k], theta_idxs[:, k]]
 
         r_pre = np.exp(log_r_pre)                       # (N, n_trials)
+
+        # Recruitment boost: multiply selected neurons' drive by alpha
+        # before DN. With recruited_mask=None and alpha=1.0 this is a no-op.
+        if recruited_mask is not None and alpha != 1.0:
+            r_pre[recruited_mask, :] *= alpha
 
         # DN: r_post = γ · r_pre / D,  D = σ² + mean_n(r_pre)
         D = sigma_sq + r_pre.mean(axis=0)                # (n_trials,)
